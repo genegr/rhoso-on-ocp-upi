@@ -42,8 +42,9 @@ compose.yaml, ansible.cfg, inventory/   toolbox service (image from ../ocp-upi),
 jumpbox/                                cloud-init user-data template + runbook for the jump box VM
 envs/                                   <env>.yaml, vault.yml (gitignored), examples
 docs/                                   network-requirements.md (doc-sourced checklist), design.md
-playbooks/, roles/                      discover, netcheck, then the RHOSO phases (rhoso.yml: tags operators,
-                                        networks)
+playbooks/, roles/                      discover, netcheck, edpm_*, then the RHOSO phases (rhoso.yml: tags
+                                        operators, networks, flasharray, controlplane, dataplane)
 plugins/modules/                        vmware_dvpg_security
+.claude/skills/                         rhoso-* skills: jumpbox, discover, netcheck, edpm-prep, deploy, dataplane, status
 .state/                                 ssh keys, rendered user-data, reports, logs
 ```
