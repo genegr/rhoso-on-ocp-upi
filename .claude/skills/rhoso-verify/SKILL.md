@@ -19,8 +19,8 @@ ansible-playbook playbooks/verify.yml -e env=<name> --tags cleanup     # after k
 ## Config (`envs/<env>.yaml`)
 `networks.external` (VLAN on physnet `datacentre`, a /24), `rhoso.verify.external` (`gateway`, `pool: [first, last]`
 host numbers) and `rhoso.verify.jumpbox_ip`, plus the `jumpbox.test_nics` entry with `network: external` (its port
-group gets the test vNIC). Image, flavors, project name and tenant CIDR are role defaults
-(`roles/rhoso_verify/defaults/main.yml`).
+group gets the test vNIC). Image, flavors, name prefix (`verify-`), tag (`rhoso-verify`) and tenant CIDR are role
+defaults (`roles/rhoso_verify/defaults/main.yml`).
 
 ## Phases (tags)
 | Tag | Kept? | Checks |
@@ -28,7 +28,7 @@ group gets the test vNIC). Image, flavors, project name and tenant CIDR are role
 | `base` | yes (Tempest needs them) | external network + no-DHCP subnet with the pool; flavors; CirrOS image `active` and stored as `image-<id>` volume on `@pure` |
 | `smoke` | no | instance ACTIVE on each compute (`--availability-zone nova:<host>`); SSH to each floating IP from the test leg; login with the metadata key, DHCP address, MTU = network MTU; ping from the first instance to all others |
 | `gateway` | — | INFO only: router gateway port binding, OVN gateway chassis priorities, distributed FIP setting |
-| `storage` | no | volume in-use; `multipath -ll` on the compute shows PURE with ≥ 2 active paths; iSCSI sessions on both fabrics; guest writes/reads a marker on `/dev/vdb`; boot-from-volume instance reachable |
+| `storage` | no | volume in-use; `multipath -ll` on the compute shows PURE with ≥ 2 active paths; iSCSI sessions on both fabrics; guest writes/reads a marker on `/dev/vdb`; a volume created from the image (cinder-volume attaches it on an OCP node); an instance booted from it, reachable |
 | `migration` | no | live migration (`--os-compute-api-version 2.30 --host`) of the instance with the volume; reachable afterwards, marker intact |
 
 `base` and `smoke` are prerequisites: narrow a run with `--skip-tags`, not `--tags`. A task error inside the phases
@@ -37,11 +37,20 @@ is recorded as an `aborted` FAIL and cleanup still runs. Any FAIL fails the play
 ## Rules and gotchas
 - The first run pings the whole pool from the test leg before the external network exists: anything answering stops
   the run. Never shrink that check; pick another pool.
-- A leftover project `rhoso-verify` (keep=true, interrupted run) stops `smoke`: run `--tags cleanup`.
+- Everything lives in the **admin** project: the openstackclient pod's CLI ignores `--os-project-name` (objects
+  landed in admin anyway and escaped a project-based cleanup, 2026-11-13). Test objects are named `verify-*`
+  (servers, volumes, networks, routers, security groups) and Neutron objects are also tagged `rhoso-verify`; later
+  calls use IDs, never names (an orphan with the same name makes a name ambiguous).
+- Never parse the output of `server create --wait`: it prints progress before the JSON. Read the server back with
+  `server show`.
+- Leftovers (keep=true, an interrupted run) stop `smoke`: run `--tags cleanup`, which runs only the cleanup (no
+  play-level `always` tags in verify.yml: tags are inherited and would run every phase).
+- Router (`router.yml`) present: the floating IPs are also reachable routed from any lab machine with the static
+  route; the test leg is kept because it doesn't depend on the router.
 - The `gateway` INFO is the evidence for the open physnet question: the masters' `datacentre` NIC is an access port
   group (VLAN 418 untagged) while the computes carry 418 tagged on `br-ex`. A gateway bound to a master with failing
   FIPs means the external VLAN can't work there.
 - OpenStack calls go through `k8s_exec` in pod `openstackclient` (no SDK in the toolbox); instance checks use `raw`
   (CirrOS has no Python); `multipath -ll`/`iscsiadm -m session` are read-only commands on the compute.
-- North-south here means jump box test leg → floating IP on the same L2. Routed reachability and instance SNAT to the
-  outside need the external router (VyOS) and aren't covered.
+- North-south here means jump box test leg → floating IP on the same L2. Routed reachability through the VyOS router
+  and the instances' SNAT to the internet aren't checked by the playbook yet.

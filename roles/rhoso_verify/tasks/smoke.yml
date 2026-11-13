@@ -1,22 +1,14 @@
 ---
-# Project, tenant network + router on the external network, one CirrOS instance pinned to every compute with a floating
-# IP. Checks: placement, DHCP/metadata (the key reaches the instance), north-south SSH from the jump box's test leg,
+# Tenant network + router on the external network, one CirrOS instance pinned to every compute with a floating IP, all
+# in the admin project, named verify-* and tagged (Neutron) rhoso-verify, referenced by ID. (No separate project: the
+# openstackclient pod's CLI ignores --os-project-name, so objects landed in admin anyway and escaped cleanup.)
+# Checks: placement, DHCP/metadata (the key reaches the instance), north-south SSH from the jump box's test leg,
 # east-west pings between all instances at the network's MTU.
-- name: A previous run's project must be gone (keep=true leaves it: run --tags cleanup)
+- name: "Nothing left from a previous run (keep=true leaves it, run --tags cleanup)"
   ansible.builtin.assert:
-    that: not vr_project_exists
-    fail_msg: "project {{ verify_project }} exists: run playbooks/verify.yml -e env={{ env }} --tags cleanup first"
+    that: vr_leftovers | length == 0
+    fail_msg: "left from a previous run: {{ vr_leftovers }}; run playbooks/verify.yml -e env={{ env }} --tags cleanup first"
     quiet: true
-
-- name: Project {{ verify_project }} with admin as member
-  kubernetes.core.k8s_exec:
-    command: "{{ item }}"
-  loop:
-    - openstack project create {{ verify_project }} --description "rhoso-on-ocp-upi verify.yml (temporary)"
-    - openstack role add --user admin --project {{ verify_project }} admin
-  register: vr_proj
-  changed_when: true
-  failed_when: vr_proj.rc | default(0) != 0
 
 - name: SSH key for the instances
   community.crypto.openssh_keypair:
@@ -33,48 +25,77 @@
     remote_path: "{{ verify_pod_dir }}/rhoso-verify.pub"
     state: to_pod
 
-- name: Keypair, security group, tenant network, router
+- name: Keypair
   kubernetes.core.k8s_exec:
     command: "{{ item }}"
   loop:
     - openstack keypair delete {{ verify_keypair }}
     - openstack keypair create {{ verify_keypair }} --public-key {{ verify_pod_dir }}/rhoso-verify.pub
-    - "{{ vos }} security group create {{ verify_prefix }}-sg"
-    - "{{ vos }} security group rule create {{ verify_prefix }}-sg --ingress --protocol icmp"
-    - "{{ vos }} security group rule create {{ verify_prefix }}-sg --ingress --protocol tcp --dst-port 22"
-    - "{{ vos }} network create {{ verify_prefix }}-net"
-    - "{{ vos }} subnet create {{ verify_prefix }}-subnet --network {{ verify_prefix }}-net --subnet-range {{ verify_tenant_cidr }}"
-    - "{{ vos }} router create {{ verify_prefix }}-router"
-    - "{{ vos }} router set {{ verify_prefix }}-router --external-gateway {{ verify_external_network }}"
-    - "{{ vos }} router add subnet {{ verify_prefix }}-router {{ verify_prefix }}-subnet"
-  loop_control:
-    label: "{{ item | regex_replace('^openstack (--os-project-name \\S+ )?', '') }}"
-  register: vr_netobj
+  register: vr_kp
   changed_when: true
   # deleting a keypair that doesn't exist is fine (first run)
-  failed_when: vr_netobj.rc | default(0) != 0 and item is not search('keypair delete')
+  failed_when: vr_kp.rc | default(0) != 0 and item is not search('keypair delete')
+
+- name: Security group, tenant network and subnet, router (tagged {{ verify_tag }})
+  kubernetes.core.k8s_exec:
+    command: "{{ item }}"
+  loop:
+    - openstack security group create {{ verify_prefix }}-sg --tag {{ verify_tag }} -f json
+    - openstack network create {{ verify_prefix }}-net --tag {{ verify_tag }} -f json
+    - openstack router create {{ verify_prefix }}-router --tag {{ verify_tag }} -f json
+  register: vr_objs
+  changed_when: true
+  failed_when: vr_objs.rc | default(0) != 0
+
+- name: Their IDs
+  ansible.builtin.set_fact:
+    vr_sg: "{{ (vr_objs.results[0].stdout | from_json).id }}"
+    vr_net_id: "{{ (vr_objs.results[1].stdout | from_json).id }}"
+    vr_router: "{{ (vr_objs.results[2].stdout | from_json).id }}"
+
+- name: Subnet
+  kubernetes.core.k8s_exec:
+    command: >-
+      openstack subnet create {{ verify_prefix }}-subnet --network {{ vr_net_id }} --subnet-range {{ verify_tenant_cidr }}
+      --tag {{ verify_tag }} -f json
+  register: vr_subnet
+  changed_when: true
+  failed_when: vr_subnet.rc | default(0) != 0
+
+- name: Rules, router gateway and interface
+  kubernetes.core.k8s_exec:
+    command: "{{ item }}"
+  loop:
+    - openstack security group rule create {{ vr_sg }} --ingress --protocol icmp
+    - openstack security group rule create {{ vr_sg }} --ingress --protocol tcp --dst-port 22
+    - openstack router set {{ vr_router }} --external-gateway {{ verify_external_network }}
+    - openstack router add subnet {{ vr_router }} {{ (vr_subnet.stdout | from_json).id }}
+  register: vr_wire
+  changed_when: true
+  failed_when: vr_wire.rc | default(0) != 0
 
 - name: Tenant network MTU
   kubernetes.core.k8s_exec:
-    command: "{{ vos }} network show {{ verify_prefix }}-net -f json"
+    command: "openstack network show {{ vr_net_id }} -f json"
   register: vr_net
   changed_when: false
   failed_when: vr_net.rc | default(0) != 0
 
+# --wait prints progress before the JSON: the result is read back with `server show` below, never parsed here.
 - name: One instance per compute (pinned with --availability-zone nova:<host>)
   kubernetes.core.k8s_exec:
     command: >-
-      {{ vos }} server create {{ verify_prefix }}-{{ item.split('.')[0] }} --flavor {{ verify_flavors[0].name }}
-      --image {{ verify_image.name }} --network {{ verify_prefix }}-net --security-group {{ verify_prefix }}-sg
-      --key-name {{ verify_keypair }} --availability-zone nova:{{ item }} --wait -f json
+      openstack server create {{ verify_prefix }}-{{ item.split('.')[0] }} --flavor {{ verify_flavors[0].name }}
+      --image {{ verify_image.name }} --network {{ vr_net_id }} --security-group {{ vr_sg }}
+      --key-name {{ verify_keypair }} --availability-zone nova:{{ item }} --wait
   loop: "{{ vr_hosts }}"
   register: vr_servers
   changed_when: true
   failed_when: false
 
-- name: Floating IPs
+- name: Floating IPs (tagged {{ verify_tag }})
   kubernetes.core.k8s_exec:
-    command: "{{ vos }} floating ip create {{ verify_external_network }} -f json"
+    command: "openstack floating ip create {{ verify_external_network }} --tag {{ verify_tag }} -f json"
   loop: "{{ vr_servers.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list }}"
   loop_control:
     label: "{{ item.item }}"
@@ -85,7 +106,7 @@
 - name: Attach them
   kubernetes.core.k8s_exec:
     command: >-
-      {{ vos }} server add floating ip {{ (item.0.stdout | from_json).id }} {{ (item.1.stdout | from_json).floating_ip_address }}
+      {{ vos }} server add floating ip {{ verify_prefix }}-{{ item.0.item.split('.')[0] }} {{ (item.1.stdout | from_json).floating_ip_address }}
   loop: "{{ vr_servers.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list | zip(vr_fips.results) | list }}"
   loop_control:
     label: "{{ item.0.item }} {{ (item.1.stdout | from_json).floating_ip_address }}"
@@ -127,7 +148,7 @@
   register: vr_ssh_port
   ignore_errors: true                     # recorded as a FAIL check below; the run goes on
 
-- name: Instances as hosts (raw: CirrOS has no Python)
+- name: Instances as hosts (raw, CirrOS has no Python)
   ansible.builtin.add_host:
     name: "{{ item.name }}"
     groups: [verify_vms]

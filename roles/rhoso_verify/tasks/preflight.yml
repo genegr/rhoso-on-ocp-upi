@@ -6,7 +6,7 @@
     vr_ext: "{{ e.networks.external }}"
     vr_dir: "{{ state_dir }}/verify"
     vr_key: "{{ state_dir }}/verify/id_rsa"
-    vos: "openstack --os-project-name {{ verify_project }}"
+    vos: openstack                     # admin project (the pod CLI ignores --os-project-name)
 
 - name: The external network is configured (networks.external, rhoso.verify.external)
   ansible.builtin.assert:
@@ -41,18 +41,12 @@
   check_mode: false
   failed_when: vr_nets.rc | default(0) != 0
 
-- name: Projects
-  kubernetes.core.k8s_exec:
-    command: openstack project list -f json
-  register: vr_projects
-  changed_when: false
-  check_mode: false
-  failed_when: vr_projects.rc | default(0) != 0
+- name: Test objects from earlier runs (by name and by tag)
+  ansible.builtin.include_tasks: leftovers.yml
 
 - name: State
   ansible.builtin.set_fact:
     vr_ext_exists: "{{ verify_external_network in (vr_nets.stdout | from_json | map(attribute='Name')) }}"
-    vr_project_exists: "{{ verify_project in (vr_projects.stdout | from_json | map(attribute='Name')) }}"
     vr_pool_ips: >-
       {%- set base = vr_ext.cidr.split('/')[0].rsplit('.', 1)[0] -%}
       {{ range(vr.external.pool[0] | int, vr.external.pool[1] | int + 1) | map('string') | map('regex_replace', '^', base ~ '.') | list }}
@@ -64,5 +58,6 @@
       - "external network {{ verify_external_network }}: {{ 'exists' if vr_ext_exists else 'to create' }}
          (vlan {{ vr_ext.vlan }} on datacentre, {{ vr_ext.cidr }}, gateway {{ vr.external.gateway }},
          pool {{ vr_pool_ips | first }}-{{ vr_pool_ips | last }})"
-      - "project {{ verify_project }}: {{ 'EXISTS (left from a run with keep=true: run --tags cleanup first)' if vr_project_exists else 'to create, removed at the end' }}"
+      - "test objects ({{ verify_prefix }}-*, tag {{ verify_tag }}): {{ ('LEFT FROM AN EARLIER RUN (run --tags cleanup first): '
+         ~ (vr_leftovers | join(', '))) if vr_leftovers else 'none; created and removed by this run' }}"
       - "jump box test leg: {{ vr.jumpbox_ip }} on the {{ (e.jumpbox.test_nics | selectattr('network', 'equalto', 'external') | first).portgroup }} test vNIC"

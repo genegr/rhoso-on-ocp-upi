@@ -72,19 +72,49 @@
   failed_when: false
   when: "'present' in vr_vdb.stdout | default('')"
 
+# Volume from the image: cinder-volume (on an OCP node) writes the image into a new Pure volume, i.e. an attach on a
+# master, the path the realm hosts broke. Named, so cleanup finds it.
+- name: Root volume {{ verify_prefix }}-bfv-root from the image
+  kubernetes.core.k8s_exec:
+    command: >-
+      {{ vos }} volume create {{ verify_prefix }}-bfv-root --image {{ verify_image.name }} --size {{ verify_volume_gb }}
+      --type {{ cinder_volume_type | default('pure') }} --bootable -f json
+  register: vr_bfv_vol
+  changed_when: true
+  failed_when: vr_bfv_vol.rc | default(0) != 0
+
+- name: Root volume available
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} volume show {{ (vr_bfv_vol.stdout | from_json).id }} -f value -c status"
+  register: vr_bfv_vol_state
+  until: vr_bfv_vol_state.stdout | trim in ['available', 'error']
+  retries: 60
+  delay: 5
+  changed_when: false
+  failed_when: false
+
 - name: Boot-from-volume instance on {{ vr_hosts[1] | default(vr_hosts[0]) }}
   kubernetes.core.k8s_exec:
     command: >-
-      {{ vos }} server create {{ verify_prefix }}-bfv --flavor {{ verify_flavors[1].name }} --image {{ verify_image.name }}
-      --boot-from-volume {{ verify_volume_gb }} --network {{ verify_prefix }}-net --security-group {{ verify_prefix }}-sg
-      --key-name {{ verify_keypair }} --availability-zone nova:{{ vr_hosts[1] | default(vr_hosts[0]) }} --wait -f json
+      {{ vos }} server create {{ verify_prefix }}-bfv --flavor {{ verify_flavors[1].name }}
+      --volume {{ (vr_bfv_vol.stdout | from_json).id }} --network {{ vr_net_id }} --security-group {{ vr_sg }}
+      --key-name {{ verify_keypair }} --availability-zone nova:{{ vr_hosts[1] | default(vr_hosts[0]) }} --wait
   register: vr_bfv
   changed_when: true
+  failed_when: false
+  when: vr_bfv_vol_state.stdout | trim == 'available'
+
+# --wait prints progress to stdout before the JSON: read the server back instead of parsing the create output.
+- name: Boot-from-volume instance details
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} server show {{ verify_prefix }}-bfv -f json"
+  register: vr_bfv_show
+  changed_when: false
   failed_when: false
 
 - name: Floating IP for it
   kubernetes.core.k8s_exec:
-    command: "{{ vos }} floating ip create {{ verify_external_network }} -f json"
+    command: "{{ vos }} floating ip create {{ verify_external_network }} --tag {{ verify_tag }} -f json"
   register: vr_bfv_fip
   changed_when: true
   failed_when: vr_bfv_fip.rc | default(0) != 0
@@ -131,9 +161,13 @@
       ok: "{{ (vr_marker.stdout | default('') | trim) == verify_marker }}"
       detail: "{{ 'no /dev/vdb in the guest' if 'present' not in vr_vdb.stdout | default('') else (vr_marker.stdout | default('') | trim) }}"
     - phase: storage
+      name: volume from the image (cinder-volume attaches on an OCP node)
+      ok: "{{ vr_bfv_vol_state.stdout | default('') | trim == 'available' }}"
+      detail: "{{ vr_bfv_vol_state.stdout | default('') | trim }}"
+    - phase: storage
       name: boot-from-volume instance ACTIVE and reachable
-      ok: "{{ vr_bfv.rc | default(1) == 0 and (vr_bfv.stdout | from_json).status == 'ACTIVE' and not (vr_bfv_ssh.failed | default(true)) }}"
-      detail: "{{ ((vr_bfv.stdout | from_json).status ~ ' ' ~ (vr_bfv_fip.stdout | from_json).floating_ip_address) if vr_bfv.rc | default(1) == 0 else (vr_bfv.stderr | default('') | trim | truncate(200)) }}"
+      ok: "{{ vr_bfv.rc | default(1) == 0 and (vr_bfv_show.stdout | default('{}') | from_json).status | default('?') == 'ACTIVE' and not (vr_bfv_ssh.failed | default(true)) }}"
+      detail: "{{ ((vr_bfv_show.stdout | default('{}') | from_json).status | default('?') ~ ' ' ~ (vr_bfv_fip.stdout | from_json).floating_ip_address) if vr_bfv.rc | default(1) == 0 else (vr_bfv.stderr | default('') | trim | truncate(200)) }}"
   loop_control:
     loop_var: chk
     label: "{{ chk.name }}"

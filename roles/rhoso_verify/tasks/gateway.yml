@@ -3,7 +3,7 @@
 # physnet datacentre is untagged VLAN on the masters but tagged on the computes), and whether FIPs are distributed.
 - name: Router gateway port
   kubernetes.core.k8s_exec:
-    command: "{{ vos }} port list --router {{ verify_prefix }}-router --device-owner network:router_gateway -f json"
+    command: "{{ vos }} port list --router {{ vr_router }} --device-owner network:router_gateway -f json"
   register: vr_gwport
   changed_when: false
   failed_when: vr_gwport.rc | default(0) != 0

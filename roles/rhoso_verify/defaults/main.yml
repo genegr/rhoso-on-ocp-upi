@@ -13,8 +13,10 @@ verify_image:
   checksum: sha256:7d6355852aeb6dbcd191bcda7cd74f1536cfe5cbf8a10495a7283a8396e4b75b
   user: cirros
 
-# Removed at the end of every run (unless -e keep=true): the project and everything in it, and the keypair.
-verify_project: rhoso-verify
+# Removed at the end of every run (unless -e keep=true): everything named <verify_prefix>-* in the admin project
+# (servers, volumes) or tagged <verify_tag> (Neutron: networks, subnets, routers, security groups, floating IPs), and
+# the keypair.
+verify_tag: rhoso-verify
 verify_prefix: verify
 verify_keypair: rhoso-verify
 verify_tenant_cidr: 192.168.199.0/24     # project network inside geneve; never leaves the cloud

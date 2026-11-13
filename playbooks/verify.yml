@@ -156,10 +156,11 @@
       when: not vr_l.vr_ext_exists and not ansible_check_mode
 
 # ---------------------------------------------------------------------------------------------------------------
+# No play-level tags here: tags are inherited, and `always` on the play made --tags cleanup run every phase too.
+# Each task carries its own (cleanup and report: always, with `apply` so the included tasks get it as well).
 - name: Verification
   hosts: localhost
   gather_facts: false
-  tags: [always]
   vars:
     rhoso_namespace: openstack
   environment:
@@ -170,6 +171,7 @@
     - name: Check mode stops here (the plan is printed above)
       ansible.builtin.meta: end_play
       when: ansible_check_mode
+      tags: [always]
 
     - name: Phases
       tags: [base, smoke, gateway, storage, migration]
@@ -236,13 +238,17 @@
       ansible.builtin.include_role:
         name: rhoso_verify
         tasks_from: cleanup
+        apply: {tags: [always]}
       when: not (keep | default(false) | bool)
+      tags: [always]
 
     - name: Report
       ansible.builtin.include_role:
         name: rhoso_verify
         tasks_from: report
+        apply: {tags: [always]}
       when: vr_checks is defined
+      tags: [always]
 
 # ---------------------------------------------------------------------------------------------------------------
 - name: Jump box test leg - remove the address

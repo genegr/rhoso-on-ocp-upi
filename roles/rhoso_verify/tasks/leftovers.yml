@@ -1,0 +1,41 @@
+---
+# Test objects in the admin project: servers, volumes, routers, networks, security groups named <verify_prefix>-*,
+# floating IPs tagged <verify_tag>. Sets vr_lo {kind: [{id, name}]} and vr_leftovers (names). Read-only.
+- name: Test objects (read-only)
+  kubernetes.core.k8s_exec:
+    command: "{{ item.cmd }}"
+  loop:
+    - {kind: servers, cmd: "openstack server list --name ^{{ verify_prefix }}- -f json"}
+    - {kind: volumes, cmd: "openstack volume list -f json"}
+    - {kind: fips, cmd: "openstack floating ip list --tags {{ verify_tag }} -f json"}
+    - {kind: routers, cmd: "openstack router list -f json"}
+    - {kind: networks, cmd: "openstack network list -f json"}
+    - {kind: security_groups, cmd: "openstack security group list -f json"}
+  loop_control:
+    label: "{{ item.kind }}"
+  register: vr_lo_raw
+  changed_when: false
+  check_mode: false
+  failed_when: vr_lo_raw.rc | default(0) != 0
+
+- name: Leftovers
+  ansible.builtin.set_fact:
+    vr_lo: >-
+      {%- set out = {} -%}
+      {%- for r in vr_lo_raw.results -%}
+      {%-   set items = r.stdout | from_json -%}
+      {%-   set mine = items if r.item.kind == 'fips' else
+                       items | selectattr('Name', 'defined') | selectattr('Name', 'match', '^' ~ verify_prefix ~ '-') | list -%}
+      {%-   set _ = out.update({r.item.kind: mine | map('dict2items')
+                 | map('selectattr', 'key', 'in', ['ID', 'Name', 'Floating IP Address']) | map('items2dict') | list}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Leftover names
+  ansible.builtin.set_fact:
+    vr_leftovers: >-
+      {%- set out = [] -%}
+      {%- for kind, items in vr_lo.items() -%}
+      {%-   for i in items -%}{%- set _ = out.append(kind ~ ':' ~ (i.Name | default(i['Floating IP Address'] | default(i.ID)))) -%}{%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
