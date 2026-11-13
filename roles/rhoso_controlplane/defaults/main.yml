@@ -1,0 +1,51 @@
+---
+# osp-secret keys (openstack-k8s-operators/architecture lib/control-plane/base/osp-secrets.env), each a random
+# password generated once into .state/<env>/osp-secret/<key>. BarbicanSimpleCryptoKEK is the base64 of 32 bytes.
+rhoso_osp_secret_keys:
+  - AdminPassword
+  - AodhDatabasePassword
+  - AodhPassword
+  - BarbicanDatabasePassword
+  - BarbicanPassword
+  - CeilometerPassword
+  - CinderDatabasePassword
+  - CinderPassword
+  - CloudKittyPassword
+  - DatabasePassword
+  - DbRootPassword
+  - DesignateDatabasePassword
+  - DesignatePassword
+  - GlanceDatabasePassword
+  - GlancePassword
+  - HeatAuthEncryptionKey
+  - HeatDatabasePassword
+  - HeatPassword
+  - IronicDatabasePassword
+  - IronicInspectorDatabasePassword
+  - IronicInspectorPassword
+  - IronicPassword
+  - KeystoneDatabasePassword
+  - ManilaDatabasePassword
+  - ManilaPassword
+  - MetadataSecret
+  - NeutronDatabasePassword
+  - NeutronPassword
+  - NovaAPIDatabasePassword
+  - NovaCell0DatabasePassword
+  - NovaCell1DatabasePassword
+  - NovaPassword
+  - OctaviaDatabasePassword
+  - OctaviaHeartbeatKey
+  - OctaviaPassword
+  - PlacementDatabasePassword
+  - PlacementPassword
+  - SwiftPassword
+  - WatcherPassword
+
+# Name shared by the OpenStackControlPlane and its OpenStackVersion.
+rhoso_controlplane_name: controlplane
+
+# Cinder: the Pure back end's volume_backend_name (as set in the template's cinderVolumes.pure) and its volume type,
+# also Cinder's default_volume_type.
+cinder_backend: pure
+cinder_volume_type: pure

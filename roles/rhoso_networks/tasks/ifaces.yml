@@ -1,0 +1,54 @@
+---
+# The OCP nodes that run workloads and their interface names per vSphere port group, from the OCP repo's cluster
+# model (NIC MACs) and each node's NodeNetworkState. Sets: ocp, rn_nodes, rn_pg_ifaces {node: {portgroup: ifname}}.
+# Shared with other roles: include_role name=rhoso_networks tasks_from=ifaces.
+- name: OCP cluster model (read-only from the OCP repo)
+  ansible.builtin.set_fact:
+    ocp: "{{ lookup('ansible.builtin.file', '/ocp/.state/clusters/' ~ e.ocp_cluster ~ '/cluster.json') | from_json }}"
+
+- name: Nodes that run workloads
+  ansible.builtin.set_fact:
+    rn_nodes: "{{ ocp.nodes | selectattr('role', 'in', (['master'] if ocp.cluster.masters_schedulable else []) + ['worker'])
+                  | list }}"
+
+- name: Node network state (interface names by MAC)
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1beta1
+    kind: NodeNetworkState
+    name: "{{ item.hostname }}"
+  loop: "{{ rn_nodes }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+  register: nns
+
+- name: Interface per node and port group (seen now)
+  ansible.builtin.set_fact:
+    rn_pg_ifaces_now: >-
+      {%- set out = {} -%}
+      {%- for r in nns.results -%}
+      {%-   set bymac = {} -%}
+      {%-   for i in r.resources[0].status.currentState.interfaces if i.type == 'ethernet' -%}
+      {%-     set _ = bymac.update({i['mac-address'] | lower: i.name}) -%}
+      {%-   endfor -%}
+      {%-   set m = {} -%}
+      {%-   for nic in r.item.nics if nic.mac | lower in bymac -%}
+      {%-     set _ = m.update({nic.network: bymac[nic.mac | lower]}) -%}
+      {%-   endfor -%}
+      {%-   set _ = out.update({r.item.name: m}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+# A NIC handed to OVN (ovnController nicMappings) leaves NodeNetworkState: keep the names recorded while visible.
+- name: Recorded interface names
+  ansible.builtin.set_fact:
+    rn_pg_ifaces: >-
+      {{ (lookup('ansible.builtin.file', state_dir ~ '/ocp-ifaces.json', errors='ignore') | default('{}', true) | from_json)
+         | combine(rn_pg_ifaces_now, recursive=true) }}
+
+- name: Record them (.state/<env>/ocp-ifaces.json)
+  ansible.builtin.copy:
+    content: "{{ rn_pg_ifaces | to_nice_json }}\n"
+    dest: "{{ state_dir }}/ocp-ifaces.json"
+    mode: "0600"
+  check_mode: false
+  changed_when: false

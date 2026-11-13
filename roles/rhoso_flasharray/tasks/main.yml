@@ -1,0 +1,90 @@
+---
+# Dedicated FlashArray user for the Cinder (and Glance-on-Cinder) Pure iSCSI back end: a member of the built-in
+# management-access policy e.rhoso.cinder.flasharray.policy (storage_admin = the storage_admin role), with its own
+# API token. Cinder's Pure driver works array-wide (no realm), so it is kept apart from the PX-CSI realm user.
+# Created with the OCP repo's purefa_realm_admin module (policy-only user, token created once). The array-admin token
+# (vault_flasharray_api_token) is used only here. The user's token lives in .state/<env>/flasharray-<user>.token;
+# -e flasharray_rotate_token=true replaces it.
+- name: FlashArray admin token is available
+  ansible.builtin.assert:
+    that: vault_flasharray_api_token | default('') | length > 0
+    fail_msg: "set vault_flasharray_api_token (array admin) in envs/vault.yml"
+    quiet: true
+  no_log: true
+
+- name: Cinder user on the array
+  vars:
+    fa: "{{ e.rhoso.cinder.flasharray }}"
+    token_file: "{{ state_dir }}/flasharray-{{ e.rhoso.cinder.flasharray.user }}.token"
+  block:
+    - name: Stored token for {{ fa.user }}
+      ansible.builtin.stat:
+        path: "{{ token_file }}"
+      register: stored_token
+
+    # Membership of a built-in policy makes the array report a role user (role = that policy), which
+    # purefa_realm_admin refuses to manage again: when it is already in that state and we hold its token, leave it.
+    - name: Admin session
+      ansible.builtin.uri:
+        url: "https://{{ fa.endpoint }}/api/2.46/login"
+        method: POST
+        headers:
+          api-token: "{{ vault_flasharray_api_token }}"
+        validate_certs: "{{ fa.validate_certs }}"
+      register: fa_admin
+      no_log: true
+      check_mode: false
+
+    - name: Existing user {{ fa.user }}
+      ansible.builtin.uri:
+        url: "https://{{ fa.endpoint }}/api/2.46/admins?names={{ fa.user }}"
+        headers:
+          x-auth-token: "{{ fa_admin.x_auth_token }}"
+        validate_certs: "{{ fa.validate_certs }}"
+        status_code: [200, 400]
+      register: fa_existing
+      check_mode: false
+
+    - name: User already in the wanted state
+      ansible.builtin.set_fact:
+        cinder_user_ok: >-
+          {{ fa_existing.status == 200 and fa_existing.json['items'] | length == 1
+             and (fa_existing.json['items'][0].role.name | default('')) == fa.policy
+             and stored_token.stat.exists and not (flasharray_rotate_token | default(false) | bool) }}
+
+    - name: User {{ fa.user }} (member of {{ fa.policy }})
+      when: not cinder_user_ok
+      purefa_realm_admin:
+        fa_url: "{{ fa.endpoint }}"
+        api_token: "{{ vault_flasharray_api_token }}"
+        validate_certs: "{{ fa.validate_certs }}"
+        name: "{{ fa.user }}"
+        policies: ["{{ fa.policy }}"]
+        # A user whose token we don't hold is useless to us: rotate it (once) in that case.
+        rotate_token: "{{ flasharray_rotate_token | default(false) | bool or not stored_token.stat.exists }}"
+      register: cinder_user
+      no_log: true
+
+    - name: Keep the user's token (only written when a new one was created)
+      ansible.builtin.copy:
+        content: "{{ cinder_user.api_token }}\n"
+        dest: "{{ token_file }}"
+        mode: "0600"
+      when: not cinder_user_ok and cinder_user.api_token | default('') | length > 0
+      no_log: true
+
+    - name: The stored token logs in as {{ fa.user }}
+      ansible.builtin.uri:
+        url: "https://{{ fa.endpoint }}/api/2.46/login"
+        method: POST
+        headers:
+          api-token: "{{ lookup('ansible.builtin.file', token_file) | trim }}"
+        validate_certs: "{{ fa.validate_certs }}"
+      register: cinder_login
+      failed_when: cinder_login.status != 200 or cinder_login.json['items'][0].username != fa.user
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "user {{ fa.user }} (policy {{ fa.policy }}) on {{ fa.endpoint }}, token in {{ token_file | basename }}"

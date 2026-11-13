@@ -1,0 +1,9 @@
+# Runtime state: SSH keys, rendered jump box user-data, discovery and netcheck reports, logs
+.state/
+
+# Environment configs and secrets stay local / on the jump box
+envs/*
+!envs/README.md
+!envs/env.example.yaml
+!envs/vault.yml.example
+.sync.env

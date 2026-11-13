@@ -1,0 +1,26 @@
+---
+# RHOSO 18.0 prerequisites and the OpenStack operator, each pinned to an exact CSV (Manual approval, installed by the
+# OCP repo's olm_operator role). Override per environment in envs/<env>.yaml under rhoso.operators.<key>.
+# NMState comes from the OCP repo's storage phase (operator + NMState instance), so it is only checked here.
+rhoso_operators_defaults:
+  metallb:
+    package: metallb-operator
+    namespace: metallb-system
+    channel: stable
+    csv: metallb-operator.v4.20.0-202611041431
+    source: redhat-operators
+    target_namespaces: []                 # AllNamespaces, as in the OCP MetalLB install procedure
+  cert_manager:
+    package: openshift-cert-manager-operator
+    namespace: cert-manager-operator
+    channel: stable-v1
+    csv: cert-manager-operator.v1.20.1
+    source: redhat-operators
+    target_namespaces: [cert-manager-operator]
+  openstack:
+    package: openstack-operator
+    namespace: openstack-operators
+    channel: stable-v1.0
+    csv: openstack-operator.v1.22.1
+    source: redhat-operators
+    target_namespaces: []

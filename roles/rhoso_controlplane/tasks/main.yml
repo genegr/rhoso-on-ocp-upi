@@ -1,0 +1,153 @@
+---
+# Deploying RHOSO 18.0, "Creating the control plane", with the Pure FlashArray iSCSI back end for Cinder (certified
+# partner image through OpenStackVersion customContainerImages) and Glance on Cinder. CR layout from
+# openstack-k8s-operators/architecture lib/control-plane (the base of the RHOSO examples), checked against the
+# installed CRDs by a server-side dry run.
+- name: Nodes and their interfaces
+  ansible.builtin.include_role:
+    name: rhoso_networks
+    tasks_from: ifaces
+
+- name: Values
+  ansible.builtin.set_fact:
+    cp: "{{ e.rhoso.controlplane }}"
+    cp_net: "{{ e.rhoso.networks | items2dict(key_name='name', value_name='cidr') }}"
+    cp_osp_dir: "{{ state_dir }}/osp-secret"
+    cp_pure_token_file: "{{ state_dir }}/flasharray-{{ e.rhoso.cinder.flasharray.user }}.token"
+    cp_ovn_nic: "{{ (rn_pg_ifaces.values() | first)[e.rhoso.controlplane.ovn_datacentre_portgroup] }}"
+
+- name: The OVN datacentre NIC has the same name on every node
+  ansible.builtin.assert:
+    that: rn_pg_ifaces.values() | map(attribute=cp.ovn_datacentre_portgroup) | unique | list | length == 1
+    quiet: true
+
+- name: RHOSO release deployed by the installed openstack-operator
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: openstack-operators
+    name: "{{ (rhoso_operators_defaults | combine(e.rhoso.operators | default({}), recursive=true)).openstack.csv }}"
+  register: os_csv
+
+- name: Release version and Pure image tag agree
+  ansible.builtin.set_fact:
+    cp_release: >-
+      {{ os_csv.resources[0].spec.install.spec.deployments | map(attribute='spec.template.spec.containers') | flatten
+         | map(attribute='env') | flatten | selectattr('name', 'equalto', 'OPENSTACK_RELEASE_VERSION')
+         | map(attribute='value') | first }}
+  failed_when: >-
+    not cp_release.startswith(e.rhoso.cinder.image.split(':')[-1] ~ '-')
+
+- name: Cinder user's token is there (flasharray phase)
+  ansible.builtin.stat:
+    path: "{{ cp_pure_token_file }}"
+  register: pure_token
+  failed_when: not pure_token.stat.exists
+
+- name: osp-secret directory
+  ansible.builtin.file:
+    path: "{{ cp_osp_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: osp-secret (passwords generated once, kept in .state)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: osp-secret
+        namespace: "{{ rhoso_namespace }}"
+      stringData: >-
+        {%- set out = {} -%}
+        {%- for k in rhoso_osp_secret_keys -%}
+        {%-   set _ = out.update({k: lookup('ansible.builtin.password', cp_osp_dir ~ '/' ~ k,
+                                         length=32, chars=['ascii_letters', 'digits'])}) -%}
+        {%- endfor -%}
+        {%- set _ = out.update({'BarbicanSimpleCryptoKEK': lookup('ansible.builtin.password',
+                                 cp_osp_dir ~ '/BarbicanSimpleCryptoKEK-raw', length=32,
+                                 chars=['ascii_letters', 'digits']) | b64encode}) -%}
+        {{ out }}
+  no_log: true
+
+- name: Cinder Pure back end secret (API token of the dedicated array user)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: cinder-volume-pure-secret
+        namespace: "{{ rhoso_namespace }}"
+      stringData:
+        pure-secrets.conf: |
+          [pure]
+          pure_api_token = {{ lookup('ansible.builtin.file', cp_pure_token_file) | trim }}
+  no_log: true
+
+- name: OpenStackVersion (release + certified Pure cinder-volume image)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: core.openstack.org/v1beta1
+      kind: OpenStackVersion
+      metadata:
+        name: "{{ rhoso_controlplane_name }}"
+        namespace: "{{ rhoso_namespace }}"
+      spec:
+        targetVersion: "{{ cp_release }}"
+        customContainerImages:
+          cinderVolumeImages:
+            pure: "{{ e.rhoso.cinder.image }}"
+
+- name: OpenStackControlPlane rendered (kept in .state for review; no secrets in it)
+  ansible.builtin.template:
+    src: openstackcontrolplane.yaml.j2
+    dest: "{{ state_dir }}/openstackcontrolplane.yaml"
+    mode: "0600"
+  check_mode: false
+  changed_when: false
+
+- name: OpenStackControlPlane
+  kubernetes.core.k8s:
+    src: "{{ state_dir }}/openstackcontrolplane.yaml"
+
+- name: Control plane Ready
+  kubernetes.core.k8s_info:
+    api_version: core.openstack.org/v1beta1
+    kind: OpenStackControlPlane
+    name: "{{ rhoso_controlplane_name }}"
+    namespace: "{{ rhoso_namespace }}"
+  register: cp_state
+  until: >-
+    (cp_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
+     | map(attribute='status') | first | default('')) == 'True'
+  retries: 120
+  delay: 30
+  when: not ansible_check_mode
+
+# Volume type for the Pure back end, Cinder's default_volume_type (customServiceConfig in the template). The toolbox has
+# no OpenStack SDK: the CLI runs in the openstackclient pod, as the docs do. Read first, create only when missing.
+- name: Volume type {{ cinder_volume_type }} (current)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack volume type show {{ cinder_volume_type }} -f json
+  register: cp_vtype
+  changed_when: false
+  failed_when: false
+  check_mode: false                       # read-only
+
+# properties: a dict in recent clients, "key='value'" text in older ones; the search covers both.
+- name: Volume type {{ cinder_volume_type }} -> back end {{ cinder_backend }}
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: >-
+      openstack volume type {{ 'create --public' if cp_vtype.rc | default(1) != 0 else 'set' }}
+      --property volume_backend_name={{ cinder_backend }}
+      --description "Everpure FlashArray (iSCSI, multipath)" {{ cinder_volume_type }}
+  when: >-
+    cp_vtype.rc | default(1) != 0
+    or (cp_vtype.stdout | from_json).properties | default('') | string
+       is not search('volume_backend_name\\W+' ~ cinder_backend ~ '\\b')

@@ -1,0 +1,266 @@
+{#- OpenStackControlPlane: openstack-k8s-operators/architecture lib/control-plane (base + service-endpoints + dns +
+    ovn-bridge components) with this environment's values. Internal endpoints: MetalLB on internalapi
+    (.<metallb first>), dnsmasq on ctlplane, RabbitMQ on internalapi (+5, +6). Disabled services stay off. -#}
+{%- set lb = e.rhoso.ranges.metallb[0] -%}
+{%- set ia = cp_net.internalapi.split('/')[0].rsplit('.', 1)[0] -%}
+{%- set cpl = cp_net.ctlplane.split('/')[0].rsplit('.', 1)[0] -%}
+{%- set iscsi_cidrs = e.rhoso.networks | selectattr('ocp_ip_owner', 'defined') | selectattr('ocp_ip_owner', 'equalto', 'ocp-storage')
+                      | map(attribute='cidr') | join(',') -%}
+{%- macro internal(pool='internalapi', ip=ia ~ '.' ~ lb) -%}
+override:
+  service:
+    internal:
+      metadata:
+        annotations:
+          metallb.universe.tf/address-pool: {{ pool }}
+          metallb.universe.tf/allow-shared-ip: {{ pool }}
+          metallb.universe.tf/loadBalancerIPs: {{ ip }}
+      spec:
+        type: LoadBalancer
+{%- endmacro -%}
+apiVersion: core.openstack.org/v1beta1
+kind: OpenStackControlPlane
+metadata:
+  name: {{ rhoso_controlplane_name }}
+  namespace: {{ rhoso_namespace }}
+spec:
+  secret: osp-secret
+  storageClass: {{ cp.storage_class }}
+  notificationsBus:
+    cluster: rabbitmq
+  tls: {}
+  barbican:
+    apiOverride:
+      route: {}
+    template:
+      databaseInstance: openstack
+      secret: osp-secret
+      barbicanAPI:
+        replicas: 3
+        {{ internal() | indent(8) }}
+      barbicanWorker:
+        replicas: 3
+      barbicanKeystoneListener:
+        replicas: 1
+  cinder:
+    uniquePodNames: true
+    apiOverride:
+      route: {}
+    template:
+      apiTimeout: 600
+      databaseInstance: openstack
+      secret: osp-secret
+      customServiceConfig: |
+        [DEFAULT]
+        default_volume_type = {{ cinder_volume_type }}
+      cinderAPI:
+        replicas: 3
+        {{ internal() | indent(8) }}
+      cinderScheduler:
+        replicas: 1
+      cinderBackup:
+        networkAttachments:
+          - storage
+        replicas: 0
+      cinderVolumes:
+        pure:
+          networkAttachments:
+            - storage
+          replicas: 1
+          customServiceConfigSecrets:
+            - cinder-volume-pure-secret
+          customServiceConfig: |
+            [DEFAULT]
+            enabled_backends = pure
+            [pure]
+            volume_backend_name = pure
+            volume_driver = cinder.volume.drivers.pure.PureISCSIDriver
+            san_ip = {{ e.rhoso.cinder.flasharray.endpoint }}
+            pure_iscsi_cidr_list = {{ iscsi_cidrs }}
+            use_multipath_for_image_xfer = true
+  designate:
+    enabled: false
+  dns:
+    template:
+      replicas: 2
+      options:
+        - key: server
+          values: {{ cp.dns_forwarders | to_json }}
+      override:
+        service:
+          metadata:
+            annotations:
+              metallb.universe.tf/address-pool: ctlplane
+              metallb.universe.tf/allow-shared-ip: ctlplane
+              metallb.universe.tf/loadBalancerIPs: {{ cpl }}.{{ lb }}
+          spec:
+            type: LoadBalancer
+  galera:
+    enabled: true
+    templates:
+      openstack:
+        replicas: 3
+        secret: osp-secret
+        storageRequest: 5Gi
+      openstack-cell1:
+        replicas: 3
+        secret: osp-secret
+        storageRequest: 5Gi
+  glance:
+    uniquePodNames: true
+    apiOverrides:
+      default:
+        route: {}
+    template:
+      databaseInstance: openstack
+      customServiceConfig: |
+        [DEFAULT]
+        enabled_backends = default_backend:cinder
+        [glance_store]
+        default_backend = default_backend
+        [default_backend]
+        rootwrap_config = /etc/glance/rootwrap.conf
+        description = Default cinder backend
+        cinder_store_auth_address = {{ '{{' }} .KeystoneInternalURL {{ '}}' }}
+        cinder_store_user_name = {{ '{{' }} .ServiceUser {{ '}}' }}
+        cinder_store_password = {{ '{{' }} .ServicePassword {{ '}}' }}
+        cinder_store_project_name = service
+        cinder_catalog_info = volumev3::internalURL
+        cinder_use_multipath = true
+      glanceAPIs:
+        default:
+          apiTimeout: 600
+          replicas: 3
+          networkAttachments:
+            - storage
+          {{ internal() | indent(10) }}
+      storage:
+        storageRequest: 10Gi
+  heat:
+    enabled: false
+  horizon:
+    enabled: true
+    apiOverride:
+      route: {}
+    template:
+      replicas: 1
+      secret: osp-secret
+  ironic:
+    enabled: false
+  keystone:
+    apiOverride:
+      route: {}
+    template:
+      databaseInstance: openstack
+      secret: osp-secret
+      replicas: 3
+      {{ internal() | indent(6) }}
+  manila:
+    enabled: false
+  memcached:
+    templates:
+      memcached:
+        replicas: 3
+  neutron:
+    apiOverride:
+      route: {}
+    template:
+      databaseInstance: openstack
+      secret: osp-secret
+      replicas: 3
+      networkAttachments:
+        - internalapi
+      {{ internal() | indent(6) }}
+  nova:
+    apiOverride:
+      route: {}
+    template:
+      secret: osp-secret
+      apiTimeout: 600
+      apiServiceTemplate:
+        replicas: 3
+        {{ internal() | indent(8) }}
+      metadataServiceTemplate:
+        replicas: 3
+        override:
+          service:
+            metadata:
+              annotations:
+                metallb.universe.tf/address-pool: internalapi
+                metallb.universe.tf/allow-shared-ip: internalapi
+                metallb.universe.tf/loadBalancerIPs: {{ ia }}.{{ lb }}
+            spec:
+              type: LoadBalancer
+      schedulerServiceTemplate:
+        replicas: 3
+      cellTemplates:
+        cell0:
+          cellDatabaseAccount: nova-cell0
+          cellDatabaseInstance: openstack
+          messagingBus:
+            cluster: rabbitmq
+          conductorServiceTemplate:
+            replicas: 1
+          hasAPIAccess: true
+        cell1:
+          cellDatabaseAccount: nova-cell1
+          cellDatabaseInstance: openstack-cell1
+          messagingBus:
+            cluster: rabbitmq-cell1
+          conductorServiceTemplate:
+            replicas: 1
+          hasAPIAccess: true
+  octavia:
+    enabled: false
+  ovn:
+    template:
+      ovnController:
+        networkAttachment: tenant
+        nicMappings:
+          datacentre: {{ cp_ovn_nic }}
+      ovnDBCluster:
+        ovndbcluster-nb:
+          dbType: NB
+          networkAttachment: internalapi
+          storageRequest: 10Gi
+          replicas: 3
+        ovndbcluster-sb:
+          dbType: SB
+          networkAttachment: internalapi
+          storageRequest: 10Gi
+          replicas: 3
+      ovnNorthd:
+        replicas: 1
+  placement:
+    apiOverride:
+      route: {}
+    template:
+      databaseInstance: openstack
+      secret: osp-secret
+      replicas: 3
+      {{ internal() | indent(6) }}
+  rabbitmq:
+    templates:
+{% for name, offset in [['rabbitmq', 5], ['rabbitmq-cell1', 6]] %}
+      {{ name }}:
+        replicas: 3
+        override:
+          service:
+            metadata:
+              annotations:
+                metallb.universe.tf/address-pool: internalapi
+                metallb.universe.tf/loadBalancerIPs: {{ ia }}.{{ lb + offset }}
+            spec:
+              type: LoadBalancer
+        resources:
+          limits:
+            cpu: "2"
+            memory: 4Gi
+          requests:
+            cpu: "1"
+            memory: 4Gi
+{% endfor %}
+  swift:
+    enabled: false
+  telemetry:
+    enabled: false

@@ -1,0 +1,143 @@
+---
+# vSphere side of the network validation (changes shared infrastructure: --check --diff, then the user's go-ahead):
+#   - the dedicated RHOSO port groups (kept afterwards: the OCP VMs use them);
+#   - one test vNIC per jump box test_nics entry (hot-added; removed with --tags cleanup).
+#   ansible-playbook playbooks/netcheck_vsphere.yml -e env=<name> [--tags portgroups|nics|cleanup]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  roles:
+    - env_model
+
+- name: vSphere
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/community.vmware.vmware:
+      hostname: "{{ e.vsphere.server }}"
+      username: "{{ vault_vsphere_user }}"
+      password: "{{ vault_vsphere_password }}"
+      validate_certs: false
+  tasks:
+    - name: Port groups on a standard vSwitch (dedicated, relaxed security for macvlan)
+      community.vmware.vmware_portgroup:
+        esxi_hostname: "{{ e.vsphere.esxi_host }}"
+        switch: "{{ item.vswitch }}"
+        portgroup: "{{ item.name }}"
+        vlan_id: "{{ item.vlan_id }}"
+        security:
+          promiscuous_mode: "{{ item.relaxed | default(false) }}"
+          forged_transmits: "{{ item.relaxed | default(false) }}"
+          mac_changes: "{{ item.relaxed | default(false) }}"
+        state: present
+      loop: "{{ e.vsphere.portgroups | selectattr('vswitch', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.name }} (VLAN {{ item.vlan_id }})"
+      tags: [portgroups]
+
+    - name: Distributed port groups (when the VLANs live on a VDS)
+      community.vmware.vmware_dvs_portgroup:
+        switch_name: "{{ item.dvswitch }}"
+        portgroup_name: "{{ item.name }}"
+        vlan_id: "{{ item.vlan_id | string }}"
+        vlan_trunk: "{{ item.vlan_id | string is search('[-,]') }}"
+        port_binding: static
+        num_ports: 16
+        network_policy:
+          inherited: false
+          promiscuous: "{{ item.relaxed | default(false) }}"
+          forged_transmits: "{{ item.relaxed | default(false) }}"
+          mac_changes: "{{ item.relaxed | default(false) }}"
+        state: present
+      loop: "{{ e.vsphere.portgroups | selectattr('dvswitch', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.name }} (VLAN {{ item.vlan_id }})"
+      tags: [portgroups]
+
+    # Existing (shared) port groups: only the security policy changes (plugins/modules/vmware_dvpg_security.py sends
+    # a spec with nothing else in it). Never creates a port group.
+    - name: Existing port groups, relaxed security policy only
+      vmware_dvpg_security:
+        hostname: "{{ e.vsphere.server }}"
+        username: "{{ vault_vsphere_user }}"
+        password: "{{ vault_vsphere_password }}"
+        validate_certs: false
+        switch: "{{ item.dvswitch }}"
+        portgroup: "{{ item.name }}"
+        promiscuous: true
+        forged_transmits: true
+        mac_changes: true
+      loop: "{{ e.vsphere.portgroups_relax_existing | default([]) }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.dvswitch }})"
+      tags: [portgroups]
+
+    - name: Jump box vNICs (before)
+      community.vmware.vmware_guest_network:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ e.jumpbox.vm.name }}"
+        gather_network_info: true
+      register: jb_nics_before
+      tags: [nics, portgroups, cleanup]
+
+    - name: Move vNICs off retired port groups (same vNIC and MAC, so the guest name stays)
+      community.vmware.vmware_guest_network:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ e.jumpbox.vm.name }}"
+        mac_address: "{{ item.mac_address }}"
+        network_name: "{{ (e.vsphere.portgroups_retired | selectattr('name', 'equalto', item.network_name) | first).replacement }}"
+        device_type: vmxnet3
+        connected: true
+        start_connected: true
+        state: present
+      loop: "{{ jb_nics_before.network_info
+                | selectattr('network_name', 'in', e.vsphere.portgroups_retired | default([]) | map(attribute='name')) | list }}"
+      loop_control:
+        label: "{{ item.mac_address }} {{ item.network_name }}"
+      tags: [nics, portgroups]
+
+    - name: Retired port groups removed
+      community.vmware.vmware_dvs_portgroup:
+        switch_name: "{{ item.dvswitch }}"
+        portgroup_name: "{{ item.name }}"
+        vlan_id: "0"
+        port_binding: static
+        state: absent
+      loop: "{{ e.vsphere.portgroups_retired | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [portgroups]
+
+    - name: Jump box vNICs
+      community.vmware.vmware_guest_network:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ e.jumpbox.vm.name }}"
+        gather_network_info: true
+      register: jb_nics
+      tags: [nics, cleanup]
+
+    - name: Test vNICs (one per port group, added only if missing)
+      community.vmware.vmware_guest_network:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ e.jumpbox.vm.name }}"
+        network_name: "{{ item }}"
+        device_type: vmxnet3
+        connected: true
+        start_connected: true
+        state: present
+      loop: "{{ e.jumpbox.test_nics | map(attribute='portgroup') | unique
+                | reject('in', jb_nics.network_info | map(attribute='network_name')) | list }}"
+      tags: [nics]
+
+    - name: Remove the test vNICs
+      community.vmware.vmware_guest_network:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ e.jumpbox.vm.name }}"
+        mac_address: "{{ item.mac_address }}"
+        state: absent
+      loop: "{{ jb_nics.network_info
+                | selectattr('network_name', 'in', e.jumpbox.test_nics | map(attribute='portgroup')) | list }}"
+      loop_control:
+        label: "{{ item.network_name }} {{ item.mac_address }}"
+      tags: [never, cleanup]

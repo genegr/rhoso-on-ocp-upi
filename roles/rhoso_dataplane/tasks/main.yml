@@ -1,0 +1,207 @@
+---
+# Deploying RHOSO 18.0, "Creating the data plane" (pre-provisioned nodes): secrets, the Pure multipath / udev / Nova
+# multipath customizations, the OpenStackDataPlaneNodeSet and an OpenStackDataPlaneDeployment.
+# Layout from openstack-k8s-operators/architecture lib/dataplane + examples/va/hci (nodeset values).
+#   -e dataplane_limit=<host>  deploy one host first (deployment edpm-<host>); without it: edpm-all.
+# A deployment is a one-shot run: a finished one is left as it is; -e dataplane_run=<suffix> starts a new one.
+- name: Values
+  ansible.builtin.set_fact:
+    dp: "{{ e.rhoso.dataplane }}"
+    dp_dir: "{{ state_dir }}/dataplane"
+    dp_deployment: "edpm-{{ dataplane_limit | default('all') }}{{ ('-' ~ dataplane_run) if dataplane_run is defined else '' }}"
+
+- name: State directory
+  ansible.builtin.file:
+    path: "{{ dp_dir }}"
+    state: directory
+    mode: "0700"
+  check_mode: false                       # local state only; --check renders the node set into it
+
+- name: Nova migration SSH key (generated once)
+  community.crypto.openssh_keypair:
+    path: "{{ dp_dir }}/nova-migration"
+    type: ecdsa
+    size: 521
+    comment: nova-migration
+  check_mode: false
+
+- name: Cluster pull secret (registry.redhat.io login for the hosts)
+  kubernetes.core.k8s_info:
+    kind: Secret
+    namespace: openshift-config
+    name: pull-secret
+  register: pull_secret
+  no_log: true
+
+- name: Secrets
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: Opaque
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ rhoso_namespace }}"
+      stringData: "{{ item.data }}"
+  # lookup('file') strips the trailing newline; OpenSSH refuses a private key without it ("invalid format").
+  loop:
+    - name: dataplane-ansible-ssh-private-key-secret
+      data:
+        ssh-privatekey: "{{ lookup('ansible.builtin.file', ssh_key) ~ '\n' }}"
+        ssh-publickey: "{{ lookup('ansible.builtin.file', ssh_key ~ '.pub') ~ '\n' }}"
+        authorized_keys: "{{ lookup('ansible.builtin.file', ssh_key ~ '.pub') ~ '\n' }}"
+    - name: nova-migration-ssh-key
+      data:
+        ssh-privatekey: "{{ lookup('ansible.builtin.file', dp_dir ~ '/nova-migration') ~ '\n' }}"
+        ssh-publickey: "{{ lookup('ansible.builtin.file', dp_dir ~ '/nova-migration.pub') ~ '\n' }}"
+    - name: libvirt-secret
+      data:
+        LibvirtPassword: "{{ lookup('ansible.builtin.password', dp_dir ~ '/LibvirtPassword', length=32,
+                                    chars=['ascii_letters', 'digits']) }}"
+    - name: redhat-registry
+      data:
+        edpm_container_registry_logins: >-
+          {%- set auth = ((pull_secret.resources[0].data['.dockerconfigjson'] | b64decode | from_json)
+                          .auths['registry.redhat.io'].auth | b64decode).split(':', 1) -%}
+          {{ {'registry.redhat.io': {auth[0]: auth[1]}} | to_json }}
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+
+- name: ConfigMaps (Pure multipath.conf for edpm_multipathd, Nova multipath)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ rhoso_namespace }}"
+      data: "{{ item.data }}"
+  loop:
+    - name: edpm-multipath
+      data:
+        multipath.conf: "{{ lookup('ansible.builtin.template', 'multipath.conf.j2') }}"
+    - name: nova-extra-config           # mounted by the default nova service (optional ConfigMap)
+      data:
+        25-nova-multipath.conf: |
+          [libvirt]
+          volume_use_multipath = True
+  loop_control:
+    label: "{{ item.name }}"
+
+# Nova multipath needs no custom service: the default nova service mounts the optional ConfigMap nova-extra-config.
+- name: Custom data-plane service pure-storage-udev (the OCP nodes' Pure udev rules, from the OCP repo)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: dataplane.openstack.org/v1beta1
+      kind: OpenStackDataPlaneService
+      metadata:
+        name: pure-storage-udev
+        namespace: "{{ rhoso_namespace }}"
+      spec:
+        playbookContents: "{{ lookup('ansible.builtin.template', 'pure-storage-udev.yml.j2') }}"
+
+- name: OpenStackDataPlaneNodeSet rendered (kept in .state for review; no secrets in it)
+  ansible.builtin.template:
+    src: nodeset.yaml.j2
+    dest: "{{ dp_dir }}/nodeset.yaml"
+    mode: "0600"
+  check_mode: false
+  changed_when: false
+
+- name: Deployments of the node set
+  kubernetes.core.k8s_info:
+    api_version: dataplane.openstack.org/v1beta1
+    kind: OpenStackDataPlaneDeployment
+    namespace: "{{ rhoso_namespace }}"
+  register: dp_all
+
+# The operator's webhook refuses any patch of a node set (even an empty one) while one of its deployments runs.
+- name: Deployments still running
+  ansible.builtin.set_fact:
+    dp_running: >-
+      {%- set out = [] -%}
+      {%- for d in dp_all.resources if dp.nodeset in d.spec.nodeSets -%}
+      {%-   set r = d.status.conditions | default([]) | selectattr('type', 'equalto', 'DeploymentReady')
+                    | map(attribute='reason') | first | default('') -%}
+      {%-   if r not in ['Ready', 'Error', 'BackoffLimitExceeded'] -%}{%- set _ = out.append(d.metadata.name) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: OpenStackDataPlaneNodeSet {{ dp.nodeset }}
+  kubernetes.core.k8s:
+    src: "{{ dp_dir }}/nodeset.yaml"
+  when: dp_running | length == 0
+
+- name: Node set left as it is (locked by a running deployment)
+  ansible.builtin.debug:
+    msg: "{{ dp.nodeset }} not applied: deployment(s) {{ dp_running | join(', ') }} still running"
+  when: dp_running | length > 0
+
+- name: Node set ready for deployment (SetupReady)
+  kubernetes.core.k8s_info:
+    api_version: dataplane.openstack.org/v1beta1
+    kind: OpenStackDataPlaneNodeSet
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ dp.nodeset }}"
+  register: ns_state
+  until: >-
+    (ns_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'SetupReady')
+     | map(attribute='status') | first | default('')) == 'True'
+  retries: 30
+  delay: 10
+  when: not ansible_check_mode
+
+# -e dataplane_deploy=false: node set only (nothing runs on the hosts), e.g. to review the generated inventory.
+- name: Existing deployment {{ dp_deployment }}
+  kubernetes.core.k8s_info:
+    api_version: dataplane.openstack.org/v1beta1
+    kind: OpenStackDataPlaneDeployment
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ dp_deployment }}"
+  register: dp_existing
+  when: dataplane_deploy | default(true) | bool
+
+- name: OpenStackDataPlaneDeployment {{ dp_deployment }} (created once)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: dataplane.openstack.org/v1beta1
+      kind: OpenStackDataPlaneDeployment
+      metadata:
+        name: "{{ dp_deployment }}"
+        namespace: "{{ rhoso_namespace }}"
+      spec: "{{ {'nodeSets': [dp.nodeset]} | combine({'ansibleLimit': dataplane_limit} if dataplane_limit is defined else {}) }}"
+  when: dataplane_deploy | default(true) | bool and dp_existing.resources | length == 0
+
+- name: Deployment {{ dp_deployment }} finished
+  kubernetes.core.k8s_info:
+    api_version: dataplane.openstack.org/v1beta1
+    kind: OpenStackDataPlaneDeployment
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ dp_deployment }}"
+  register: dp_state
+  # Terminal failure = the job condition (DeploymentReady). Ready and InputReady also read Error while cert-manager
+  # is still issuing the per-node TLS certificates; that clears on its own.
+  until: >-
+    (dp_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
+     | map(attribute='status') | first | default('')) == 'True'
+    or (dp_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'DeploymentReady')
+        | map(attribute='reason') | first | default('')) in ['Error', 'BackoffLimitExceeded']
+  retries: 180
+  delay: 20
+  failed_when: >-
+    (dp_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
+     | map(attribute='status') | first | default('')) != 'True'
+  when: not ansible_check_mode and dataplane_deploy | default(true) | bool
+
+# "Deploying the data plane", last step: map the new Compute hosts to their cell (nova-manage cell_v2 discover_hosts
+# in the cell0 conductor). Nova's periodic discovery is off in RHOSO (discover_hosts_in_cells_interval = -1).
+- name: Map the Compute hosts to their cell
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: nova-cell0-conductor-0
+    command: nova-manage cell_v2 discover_hosts --verbose
+  register: dp_discover
+  changed_when: "'Creating host mapping' in dp_discover.stdout"
+  failed_when: dp_discover.rc | default(0) != 0
+  when: not ansible_check_mode and dataplane_deploy | default(true) | bool

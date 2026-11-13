@@ -1,0 +1,129 @@
+---
+# Deploying RHOSO 18.0, "Preparing Red Hat OpenShift Container Platform for Red Hat OpenStack Services on OpenShift"
+# and "Installing and preparing the OpenStack Operator":
+#   NMState operator + instance, MetalLB operator + MetalLB instance, cert-manager operator, OVN-Kubernetes global IP
+#   forwarding, the openstack-operators install with its OpenStack initialization CR, and the openstack namespace.
+- name: Operator pins (defaults + envs/<env>.yaml rhoso.operators)
+  ansible.builtin.set_fact:
+    ops: "{{ rhoso_operators_defaults | combine(e.rhoso.operators | default({}), recursive=true) }}"
+
+- name: NMState instance exists (from the OCP repo's storage phase)
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NMState
+    name: nmstate
+  register: nmstate
+  failed_when: nmstate.resources | length == 0
+
+- name: OVN-Kubernetes global IP forwarding (gatewayConfig.ipForwarding Global)
+  kubernetes.core.k8s:
+    api_version: operator.openshift.io/v1
+    kind: Network
+    name: cluster
+    state: patched
+    merge_type: merge
+    definition:
+      spec:
+        defaultNetwork:
+          ovnKubernetesConfig:
+            gatewayConfig:
+              ipForwarding: Global
+
+- name: Operators
+  ansible.builtin.include_role:
+    name: olm_operator
+  vars:
+    olm_package: "{{ ops[op_key].package }}"
+    olm_namespace: "{{ ops[op_key].namespace }}"
+    olm_channel: "{{ ops[op_key].channel }}"
+    olm_csv: "{{ ops[op_key].csv }}"
+    olm_source: "{{ ops[op_key].source }}"
+    olm_target_namespaces: "{{ ops[op_key].target_namespaces }}"
+  loop: [metallb, cert_manager, openstack]
+  loop_control:
+    loop_var: op_key                      # the role loops over `item` itself (vars are evaluated lazily)
+    label: "{{ ops[op_key].csv }}"
+
+- name: Instances (skipped in --check before the operators exist)
+  when: not ansible_check_mode or olm_csv_ready | default(false)
+  block:
+    - name: MetalLB instance
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: metallb.io/v1beta1
+          kind: MetalLB
+          metadata:
+            name: metallb
+            namespace: "{{ ops.metallb.namespace }}"
+
+    - name: OpenStack operator initialization (OpenStack CR)
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: operator.openstack.org/v1beta1
+          kind: OpenStack
+          metadata:
+            name: openstack
+            namespace: "{{ ops.openstack.namespace }}"
+
+- name: Namespace {{ rhoso_namespace }} (privileged pod security, no label sync)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ rhoso_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: privileged
+          security.openshift.io/scc.podSecurityLabelSync: "false"
+
+- name: Ready checks
+  when: not ansible_check_mode
+  block:
+    - name: MetalLB controller and speakers running
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ ops.metallb.namespace }}"
+        label_selectors: ["component in (controller,speaker)"]
+      register: mlb
+      until: >-
+        mlb.resources | selectattr('metadata.labels.component', 'equalto', 'speaker') | list | length >= 3
+        and mlb.resources | rejectattr('status.phase', 'equalto', 'Running') | list | length == 0
+      retries: 60
+      delay: 10
+
+    - name: cert-manager deployments available
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: cert-manager
+      register: cm
+      until: >-
+        cm.resources | length >= 3
+        and cm.resources | rejectattr('status.availableReplicas', 'defined') | list | length == 0
+      retries: 60
+      delay: 10
+
+    - name: OpenStack operator initialized (OpenStack CR Ready)
+      kubernetes.core.k8s_info:
+        api_version: operator.openstack.org/v1beta1
+        kind: OpenStack
+        name: openstack
+        namespace: "{{ ops.openstack.namespace }}"
+      register: osinit
+      until: >-
+        osinit.resources | length > 0
+        and (osinit.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
+             | map(attribute='status') | first | default('')) == 'True'
+      retries: 90
+      delay: 10
+
+    - name: OVN-Kubernetes rolled out the IP forwarding change (network operator not Progressing)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: ClusterOperator
+        name: network
+      register: netco
+      until: >-
+        (netco.resources[0].status.conditions | selectattr('type', 'equalto', 'Progressing')
+         | map(attribute='status') | first) == 'False'
+      retries: 60
+      delay: 10

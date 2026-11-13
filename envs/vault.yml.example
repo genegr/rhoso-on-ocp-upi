@@ -1,0 +1,9 @@
+# Copy to envs/vault.yml on the jump box and encrypt it:
+#   docker compose run --rm toolbox ansible-vault encrypt envs/vault.yml
+# Never commit or sync envs/vault.yml.
+vault_vsphere_user: administrator@vsphere.local
+vault_vsphere_password: CHANGE_ME
+vault_ad_user: EXAMPLE\administrator
+vault_ad_password: CHANGE_ME
+vault_edpm_root_password: CHANGE_ME     # one-time bootstrap of the data-plane SSH key
+vault_flasharray_api_token: CHANGE_ME

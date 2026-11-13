@@ -1,0 +1,27 @@
+{# Per-host summary for discover.yml: OS, CPU/RAM, NICs (physical and logical), routes, DNS, time sync. #}
+os: "{{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}"
+kernel: "{{ ansible_facts.kernel }}"
+vendor: "{{ ansible_facts.system_vendor | default('') }} {{ ansible_facts.product_name | default('') }}"
+cpus: {{ ansible_facts.processor_vcpus | default(0) }}
+memory_mb: {{ ansible_facts.memtotal_mb | default(0) }}
+default_ipv4: {{ ansible_facts.default_ipv4 | default({}) | dict2items | selectattr('key', 'in', ['interface', 'address', 'gateway', 'mtu']) | items2dict | to_json }}
+dns: {{ ansible_facts.dns | default({}) | to_json }}
+interfaces:
+{% for name in ansible_facts.interfaces | sort if name != 'lo' %}
+{%   set i = ansible_facts[name | replace('-', '_')] | default({}) %}
+  {{ name }}:
+    type: {{ i.type | default('') | to_json }}
+    module: {{ i.module | default('') | to_json }}
+    mac: {{ i.macaddress | default('') | to_json }}
+    active: {{ i.active | default(false) | to_json }}
+    speed: {{ i.speed | default(-1) | to_json }}
+    mtu: {{ i.mtu | default(0) | to_json }}
+    ipv4: {{ ([i.ipv4] if (i.ipv4 | default(none)) is mapping else []) | union(i.ipv4_secondaries | default([])) | map(attribute='address') | list | to_json }}
+    pciid: {{ i.pciid | default('') | to_json }}
+{% endfor %}
+disks: {{ ansible_facts.devices | default({}) | dict2items | rejectattr('key', 'match', '^(loop|dm-|sr)') | map(attribute='key') | list | to_json }}
+{% if rhsm_cert is defined %}
+subscribed: {{ (rhsm_cert.matched | default(0)) > 0 }}
+nm_profiles: {{ nm_profiles.files | default([]) | map(attribute='path') | map('basename') | list | to_json }}
+chronyd: {{ (ansible_facts.services['chronyd.service'] | default({})).state | default('absent') | to_json }}
+{% endif %}

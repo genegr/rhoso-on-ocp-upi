@@ -1,0 +1,375 @@
+---
+# Network layout validation against docs/network-requirements.md, before anything is deployed.
+#   jump box: a probe container with one macvlan leg per test vNIC (netcheck_vsphere.yml adds the vNICs);
+#   data-plane hosts: temporary rhoso-test-* NetworkManager connections (VLANs on the trunk NIC, iSCSI NICs that
+#   have no address yet). Existing connections are never modified.
+# Then pings (DF, per MTU), iSCSI portals, SSH, registries, DNS, time sync; report in .state/<env>/netcheck-report.md.
+# Everything temporary is removed at the end (-e keep=true to keep it for debugging; --tags cleanup to retry).
+# Changes the jump box and the hosts: run with --check --diff first and get the go-ahead.
+#   ansible-playbook playbooks/netcheck.yml -e env=<name> [--limit localhost,jumpbox,<host>,...]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  roles:
+    - env_model
+  tasks:
+    - name: Test networks are /24 (host test IPs are built from the last octet)
+      ansible.builtin.assert:
+        that: e.networks[item.network].cidr is search('/24$')
+        quiet: true
+      loop: "{{ e.jumpbox.test_nics }}"
+      loop_control:
+        label: "{{ item.network }}"
+
+    - name: Networks tested through the probe (macvlan) and from the jump box's own address
+      ansible.builtin.set_fact:
+        nc_probe_nets: >-
+          {%- set out = [] -%}
+          {%- for n in e.jumpbox.test_nics if n.probe | default(true) -%}{%- set _ = out.append(n.network) -%}{%- endfor -%}
+          {{ out }}
+        nc_own_nets: >-
+          {%- set out = [] -%}
+          {%- for n in e.jumpbox.test_nics if not (n.probe | default(true)) -%}{%- set _ = out.append(n.network) -%}{%- endfor -%}
+          {{ out }}
+
+    - name: Addresses that must not answer (planned ranges)
+      ansible.builtin.set_fact:
+        nc_free_ips: >-
+          {%- set out = [] -%}
+          {%- for r in e.netcheck.free_ranges -%}
+          {%-   set base = r[0].rsplit('.', 1)[0] -%}
+          {%-   for o in range(r[0].rsplit('.', 1)[1] | int, (r[1].rsplit('.', 1)[1] | int) + 1) -%}
+          {%-     set _ = out.append(base ~ '.' ~ o) -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+# ---------------------------------------------------------------------------------------------------------------
+- name: Jump box - free ranges and probe
+  hosts: jumpbox
+  gather_facts: false
+  tags: [setup]
+  vars:
+    e: "{{ hostvars['localhost'].e }}"
+    workdir: /var/tmp/rhoso-netcheck
+  tasks:
+    - name: Planned addresses are unused (checked before any test interface exists)
+      ansible.builtin.command: ping -c 1 -W 1 {{ item }}
+      loop: "{{ hostvars['localhost'].nc_free_ips }}"
+      register: nc_free
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Test vNICs up with MTU 9000 (systemd-networkd); probe:false NICs get the test address themselves
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/90-rhoso-test-{{ item.ifname }}.network
+        mode: "0644"
+        content: |
+          # Managed by rhoso-on-ocp-upi netcheck.yml - temporary
+          [Match]
+          Name={{ item.ifname }}
+          [Link]
+          MTUBytes=9000
+          RequiredForOnline=no
+          [Network]
+          LinkLocalAddressing=no
+          ConfigureWithoutCarrier=yes
+          {% if not item.probe | default(true) %}
+          Address={{ e.netcheck.probe_ips[item.network] }}/{{ e.networks[item.network].cidr.split('/')[1] }}
+          {% endif %}
+      loop: "{{ e.jumpbox.test_nics | unique(attribute='ifname') | list }}"
+      loop_control:
+        label: "{{ item.ifname }} ({{ item.network }})"
+      register: nc_netd
+
+    - name: Apply the networkd files
+      ansible.builtin.systemd_service:
+        name: systemd-networkd
+        state: restarted
+      when: nc_netd is changed
+
+    - name: Probe directory
+      ansible.builtin.file:
+        path: "{{ workdir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Probe compose file
+      ansible.builtin.template:
+        src: templates/netcheck-compose.yaml.j2
+        dest: "{{ workdir }}/compose.yaml"
+        mode: "0644"
+
+    - name: Probe up
+      community.docker.docker_compose_v2:
+        project_src: "{{ workdir }}"
+        state: present
+        wait: true
+      when: not ansible_check_mode
+
+# ---------------------------------------------------------------------------------------------------------------
+- name: Data-plane hosts - temporary connections and host-side checks
+  hosts: edpm
+  gather_facts: true
+  tags: [setup, checks]
+  vars:
+    e: "{{ hostvars['localhost'].e }}"
+    idx: "{{ groups['edpm'].index(inventory_hostname) }}"
+    trunk_nic: "{{ edpm.trunk_nic | default(e.netcheck.trunk_nic, true) | default(ansible_facts.default_ipv4.interface, true) }}"
+  tasks:
+    - name: Host test addresses and iSCSI NICs without an address
+      ansible.builtin.set_fact:
+        nc_targets: >-
+          {%- set t = {'ctlplane': edpm.ip} -%}
+          {%- for n in e.netcheck.host_vlan_networks -%}
+          {%-   set _ = t.update({n: e.networks[n].cidr.split('/')[0].rsplit('.', 1)[0] ~ '.' ~ (e.netcheck.host_ip_base | int + idx | int)}) -%}
+          {%- endfor -%}
+          {%- for ip in edpm.iscsi_ips | default([]) -%}
+          {%-   set _ = t.update({['storage', 'storage_b'][loop.index0]: ip}) -%}
+          {%- endfor -%}
+          {{ t }}
+        nc_iscsi_missing: >-
+          {%- set out = [] -%}
+          {%- for nic, ip in edpm.iscsi_nics | default([]) | zip(edpm.iscsi_ips | default([])) -%}
+          {%-   set f = ansible_facts[nic | replace('-', '_')] | default({}) -%}
+          {%-   if f and f.ipv4 is not defined -%}{%- set _ = out.append({'nic': nic, 'ip': ip}) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Temporary VLAN connections on the trunk NIC
+      community.general.nmcli:
+        conn_name: rhoso-test-{{ item }}
+        ifname: rt-{{ e.networks[item].vlan }}        # interface names are limited to 15 characters
+        type: vlan
+        vlandev: "{{ trunk_nic }}"
+        vlanid: "{{ e.networks[item].vlan }}"
+        ip4: "{{ nc_targets[item] }}/24"
+        method4: manual
+        method6: disabled
+        never_default4: true
+        autoconnect: false
+        state: present
+      loop: "{{ e.netcheck.host_vlan_networks }}"
+
+    - name: Temporary addresses on unconfigured iSCSI NICs
+      community.general.nmcli:
+        conn_name: rhoso-test-{{ item.nic }}
+        type: ethernet
+        ifname: "{{ item.nic }}"
+        ip4: "{{ item.ip }}/24"
+        method4: manual
+        method6: disabled
+        never_default4: true
+        autoconnect: false
+        state: present
+      loop: "{{ nc_iscsi_missing }}"
+
+    - name: Activate the temporary connections
+      community.general.nmcli:
+        conn_name: "{{ item }}"
+        state: up
+      loop: "{{ e.netcheck.host_vlan_networks | map('regex_replace', '^', 'rhoso-test-')
+                + nc_iscsi_missing | map(attribute='nic') | map('regex_replace', '^', 'rhoso-test-') }}"
+      when: not ansible_check_mode
+
+    - name: Host -> probe, DF ping per network and MTU
+      ansible.builtin.command: ping -c 2 -W 1 -M do -s {{ item.1 - 28 }} {{ e.netcheck.probe_ips[item.0] }}
+      loop: "{{ e.jumpbox.test_nics | map(attribute='network') | select('in', nc_targets) | product(e.netcheck.mtus) | list }}"
+      register: nc_ping
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Host -> other hosts on the L2-only VLANs (isolates the switch side from the vSphere side)
+      ansible.builtin.command: ping -c 2 -W 1 -M do -s 1472 {{ hostvars[item.0].nc_targets[item.1] }}
+      loop: "{{ ansible_play_hosts | reject('equalto', inventory_hostname) | product(e.netcheck.host_vlan_networks) | list }}"
+      loop_control:
+        label: "{{ item.0 }} {{ item.1 }}"
+      register: nc_peer_ping
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Neighbour table (who answered for the probe addresses)
+      ansible.builtin.slurp:
+        src: /proc/net/arp
+      register: nc_arp
+
+    - name: Array iSCSI portals (TCP 3260)
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: 3260
+        timeout: 3
+      loop: "{{ (e.flasharray.iscsi_portals.storage if 'storage' in nc_targets else [])
+                + (e.flasharray.iscsi_portals.storage_b if 'storage_b' in nc_targets else []) }}"
+      register: nc_iscsi
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Registries and content (HTTPS)
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        method: HEAD
+        timeout: 10
+        status_code: [200, 301, 302, 401, 403, 404]
+      loop: "{{ e.netcheck.urls }}"
+      register: nc_urls
+      failed_when: false
+
+    - name: Services (chronyd)
+      ansible.builtin.service_facts:
+
+    - name: Host results
+      ansible.builtin.set_fact:
+        nc_host:
+          trunk_nic: "{{ trunk_nic }}"
+          trunk_nic_mtu: "{{ ansible_facts[trunk_nic | replace('-', '_')].mtu | default('?') }}"
+          ping: "{{ nc_ping.results | default([]) | rejectattr('skipped', 'defined')
+                    | map(attribute='item') | zip(nc_ping.results | default([]) | rejectattr('skipped', 'defined')
+                    | map(attribute='rc')) | list }}"
+          arp: >-
+            {%- set out = {} -%}
+            {%- for line in (nc_arp.content | b64decode).splitlines()[1:] -%}
+            {%-   set f = line.split() -%}
+            {%-   if f | length > 3 -%}{%- set _ = out.update({f[0]: f[3]}) -%}{%- endif -%}
+            {%- endfor -%}
+            {{ out }}
+          iscsi: "{{ nc_iscsi.results | default([]) | rejectattr('skipped', 'defined')
+                     | map(attribute='item') | zip(nc_iscsi.results | default([]) | rejectattr('skipped', 'defined')
+                     | map(attribute='msg', default='ok')) | list }}"
+          urls: "{{ nc_urls.results | map(attribute='item') | zip(nc_urls.results | map(attribute='status', default=-1)) | list }}"
+          chronyd: "{{ (ansible_facts.services['chronyd.service'] | default({})).state | default('absent') }}"
+          peers: "{{ nc_peer_ping.results | default([]) | rejectattr('skipped', 'defined')
+                     | map(attribute='item') | zip(nc_peer_ping.results | default([]) | rejectattr('skipped', 'defined')
+                     | map(attribute='rc')) | list }}"
+
+# ---------------------------------------------------------------------------------------------------------------
+- name: Jump box - probe-side checks
+  hosts: jumpbox
+  gather_facts: false
+  tags: [checks]
+  vars:
+    e: "{{ hostvars['localhost'].e }}"
+    workdir: /var/tmp/rhoso-netcheck
+  tasks:
+    - name: Probe -> hosts, DF ping per network and MTU
+      community.docker.docker_compose_v2_exec:
+        project_src: "{{ workdir }}"
+        service: probe
+        command: ping -c 2 -W 1 -M do -s {{ item.2 - 28 }} {{ hostvars[item.0].nc_targets[item.1] }}
+      loop: "{{ groups['edpm'] | product(hostvars['localhost'].nc_probe_nets, e.netcheck.mtus) | list }}"
+      loop_control:
+        label: "{{ item.0 }} {{ item.1 }} {{ item.2 }}"
+      register: nc_probe_ping
+      changed_when: false
+      failed_when: false
+      when:
+        - not ansible_check_mode
+        - item.1 in (hostvars[item.0].nc_targets | default({}))
+
+    - name: Jump box (own address, probe:false networks) -> hosts, DF ping per network and MTU
+      ansible.builtin.command: >-
+        ping -c 2 -W 1 -M do -s {{ item.2 - 28 }} -I {{ e.netcheck.probe_ips[item.1] }}
+        {{ hostvars[item.0].nc_targets[item.1] }}
+      loop: "{{ groups['edpm'] | product(hostvars['localhost'].nc_own_nets, e.netcheck.mtus) | list }}"
+      loop_control:
+        label: "{{ item.0 }} {{ item.1 }} {{ item.2 }}"
+      register: nc_jb_ping
+      changed_when: false
+      failed_when: false
+      when:
+        - not ansible_check_mode
+        - item.1 in (hostvars[item.0].nc_targets | default({}))
+
+    - name: Jump box -> array iSCSI portals (TCP 3260, through its own iSCSI NICs)
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: 3260
+        timeout: 3
+      loop: "{{ e.flasharray.iscsi_portals.storage + e.flasharray.iscsi_portals.storage_b }}"
+      register: nc_jb_iscsi
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: SSH to every host's ctlplane address
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item].edpm.ip }}"
+        port: 22
+        timeout: 3
+      loop: "{{ groups['edpm'] }}"
+      register: nc_ssh
+      failed_when: false
+
+    - name: Registries and content (HTTPS) from the jump box
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        method: HEAD
+        timeout: 10
+        status_code: [200, 301, 302, 401, 403, 404]
+      loop: "{{ e.netcheck.urls }}"
+      register: nc_urls
+      failed_when: false
+
+# ---------------------------------------------------------------------------------------------------------------
+- name: Data-plane hosts - cleanup
+  hosts: edpm
+  gather_facts: false
+  tags: [cleanup]
+  vars:
+    e: "{{ hostvars['localhost'].e }}"
+  tasks:
+    - name: Remove the temporary connections
+      community.general.nmcli:
+        conn_name: "rhoso-test-{{ item }}"
+        state: absent
+      loop: "{{ e.netcheck.host_vlan_networks + (edpm.iscsi_nics | default([])) }}"
+      when: not (keep | default(false) | bool)
+
+- name: Jump box - cleanup
+  hosts: jumpbox
+  gather_facts: false
+  tags: [cleanup]
+  vars:
+    e: "{{ hostvars['localhost'].e }}"
+    workdir: /var/tmp/rhoso-netcheck
+  tasks:
+    - name: Cleanup
+      when: not (keep | default(false) | bool)
+      block:
+        - name: Look for the probe
+          ansible.builtin.stat:
+            path: "{{ workdir }}/compose.yaml"
+          register: nc_compose
+        - name: Probe down (Docker removes the macvlan networks and their VLAN sub-interfaces)
+          community.docker.docker_compose_v2:
+            project_src: "{{ workdir }}"
+            state: absent
+          when: nc_compose.stat.exists
+        - name: Probe directory
+          ansible.builtin.file:
+            path: "{{ workdir }}"
+            state: absent
+        - name: networkd test files (the vNICs themselves go with netcheck_vsphere.yml --tags cleanup)
+          ansible.builtin.file:
+            path: /etc/systemd/network/90-rhoso-test-{{ item }}.network
+            state: absent
+          loop: "{{ e.jumpbox.test_nics | map(attribute='ifname') | unique | list }}"
+
+# ---------------------------------------------------------------------------------------------------------------
+- name: Report
+  hosts: localhost
+  gather_facts: false
+  tags: [checks]
+  tasks:
+    - name: Names through the AD DNS server
+      ansible.builtin.set_fact:
+        nc_dns: "{{ nc_dns | default({}) | combine({item: lookup('community.general.dig', item, '@' ~ e.ad.server, fail_on_error=false)}) }}"
+      loop: "{{ e.netcheck.dns_names + [e.edpm_hosts[0].name ~ '.' ~ e.jumpbox.search_domain] }}"
+
+    - name: Write .state/<env>/netcheck-report.md
+      ansible.builtin.template:
+        src: templates/netcheck-report.md.j2
+        dest: "{{ state_dir }}/netcheck-report.md"
+        mode: "0600"

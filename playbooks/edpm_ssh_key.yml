@@ -1,0 +1,24 @@
+---
+# One-time: authorize the toolbox SSH key for root on the data-plane hosts, logging in with the root password from
+# the vault (ssh + sshpass from the toolbox). Changes the hosts: run --check --diff first, then with go-ahead.
+#   ansible-playbook playbooks/edpm_ssh_key.yml -e env=<name> [--limit <host>]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - env_model
+
+- name: Authorize the toolbox key
+  hosts: edpm
+  gather_facts: false
+  vars:
+    ansible_password: "{{ hostvars['localhost'].vault_edpm_root_password }}"
+    ansible_ssh_private_key_file: null
+    ansible_ssh_common_args: -o PubkeyAuthentication=no -o PreferredAuthentications=password
+  tasks:
+    - name: Toolbox public key in root's authorized_keys
+      ansible.posix.authorized_key:
+        user: root
+        key: "{{ lookup('ansible.builtin.file', hostvars['localhost'].ssh_key ~ '.pub') }}"
+        comment: rhoso-toolbox
+        state: present

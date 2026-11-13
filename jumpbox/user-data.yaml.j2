@@ -1,0 +1,85 @@
+#cloud-config
+# Jump box first boot (Ubuntu 26.04 Canonical cloud image OVA). Rendered per environment into .state/jumpbox/
+# (gitignored) and pasted base64-encoded into the OVA's "Encoded user-data" property. Docker Engine with Compose v2
+# and buildx is the only software installed: every other tool lives in the toolbox container.
+# The primary NIC is matched by MAC (jumpbox.mac, set as a manual MAC on the VM before first boot), so the guest
+# NIC name never matters and test vNICs added later are never configured by this file.
+# Variables (all from envs/<env>.yaml): jumpbox.{hostname,user,ssh_authorized_keys,mac,ip,prefix,extra_ips,
+# gateway,dns_servers,search_domain}, docker.* (pinned versions).
+hostname: {{ jumpbox.hostname }}
+fqdn: {{ jumpbox.hostname }}.{{ jumpbox.search_domain }}
+manage_etc_hosts: true
+
+# Created before the users (and before the docker package, whose postinst reuses it).
+groups:
+  - docker
+
+users:
+  - name: {{ jumpbox.user }}
+    groups: [sudo, docker]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+{% for key in jumpbox.ssh_authorized_keys %}
+      - {{ key }}
+{% endfor %}
+
+ssh_pwauth: false
+
+# Static addressing. The extra IPs are the HAProxy VIPs (API, ingress) of the OCP cluster: the infra host must
+# own them (ocp-upi-baremetal-vms README).
+write_files:
+  - path: /etc/netplan/50-static.yaml
+    permissions: "0600"
+    content: |
+      network:
+        version: 2
+        ethernets:
+          mgmt:
+            match:
+              macaddress: "{{ jumpbox.mac }}"
+            dhcp4: false
+            dhcp6: false
+            addresses:
+              - {{ jumpbox.ip }}/{{ jumpbox.prefix }}
+{% for ip in jumpbox.extra_ips %}
+              - {{ ip }}/{{ jumpbox.prefix }}
+{% endfor %}
+            routes:
+              - to: default
+                via: {{ jumpbox.gateway }}
+            nameservers:
+              addresses: [{{ jumpbox.dns_servers | join(', ') }}]
+              search: [{{ jumpbox.search_domain }}]
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    content: |
+      network: {config: disabled}
+  - path: /etc/apt/preferences.d/docker-pin
+    content: |
+{% for pkg, ver in docker.packages.items() %}
+      Package: {{ pkg }}
+      Pin: version {{ ver }}
+      Pin-Priority: 1001
+
+{% endfor %}
+
+apt:
+  sources:
+    docker.list:
+      source: "deb [arch=amd64 signed-by=$KEY_FILE] https://download.docker.com/linux/ubuntu {{ docker.suite }} stable"
+      keyid: {{ docker.gpg_fingerprint }}
+
+package_update: true
+packages:
+{% for pkg, ver in docker.packages.items() %}
+  - [{{ pkg }}, "{{ ver }}"]
+{% endfor %}
+  - open-vm-tools
+  - chrony
+
+runcmd:
+  - [rm, -f, /etc/netplan/50-cloud-init.yaml]
+  - [netplan, apply]
+  - [systemctl, enable, --now, docker.service]
+  - [apt-mark, hold, {{ docker.packages.keys() | join(', ') }}]

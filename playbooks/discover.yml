@@ -1,0 +1,218 @@
+---
+# Read-only discovery of the environment: vSphere host networking and capacity, AD DNS, jump box and data-plane host
+# NICs / OS / subscription / time sync. Report: .state/<env>/discovery.yml.
+#   ansible-playbook playbooks/discover.yml -e env=<name> [--tags vsphere,dns,jumpbox,edpm]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  roles:
+    - env_model
+
+- name: vSphere
+  hosts: localhost
+  gather_facts: false
+  tags: [vsphere]
+  module_defaults:
+    group/community.vmware.vmware:
+      hostname: "{{ e.vsphere.server }}"
+      username: "{{ vault_vsphere_user }}"
+      password: "{{ vault_vsphere_password }}"
+      validate_certs: false
+  tasks:
+    - name: vCenter, clusters, datastores, host NICs, switches, port groups
+      no_log: true
+      block:
+        - name: Datacenters
+          community.vmware.vmware_datacenter_info: {}
+          register: vs_dcs
+        - name: Clusters
+          community.vmware.vmware_cluster_info:
+            datacenter: "{{ item.name }}"
+          loop: "{{ vs_dcs.datacenter_info }}"
+          register: vs_clusters_raw
+        - name: Clusters (merged)
+          ansible.builtin.set_fact:
+            vs_clusters:
+              clusters: "{{ vs_clusters_raw.results | map(attribute='clusters') | combine }}"
+        - name: Host capacity
+          community.vmware.vmware_host_facts:
+            esxi_hostname: "{{ e.vsphere.esxi_host }}"
+          register: vs_host
+        - name: Datastores
+          community.vmware.vmware_datastore_info:
+            datacenter: "{{ e.vsphere.datacenter }}"
+          register: vs_ds
+        - name: Physical NICs
+          community.vmware.vmware_host_vmnic_info:
+            esxi_hostname: "{{ e.vsphere.esxi_host }}"
+            capabilities: false
+            directpath_io: false
+            sriov: false
+          register: vs_vmnics
+        - name: Standard vSwitches
+          community.vmware.vmware_vswitch_info:
+            esxi_hostname: "{{ e.vsphere.esxi_host }}"
+          register: vs_vswitch
+        - name: Standard port groups (VLAN, security policy)
+          community.vmware.vmware_portgroup_info:
+            esxi_hostname: "{{ e.vsphere.esxi_host }}"
+            policies: true
+          register: vs_pg
+        - name: Distributed switches
+          community.vmware.vmware_dvswitch_info: {}
+          register: vs_dvs
+          failed_when: false
+        - name: Distributed port groups
+          community.vmware.vmware_dvs_portgroup_info:
+            datacenter: "{{ (vs_clusters.clusters.values() | first).datacenter }}"
+            show_vlan_info: true
+            show_network_policy: true
+          register: vs_dvpg
+          failed_when: false
+
+    - name: vSphere summary
+      ansible.builtin.set_fact:
+        discovered_vsphere:
+          clusters: "{{ vs_clusters.clusters | dict2items | map(attribute='key') | list }}"
+          datacenter: "{{ (vs_clusters.clusters.values() | first).datacenter }}"
+          host:
+            cpu_cores: "{{ vs_host.ansible_facts.ansible_processor_cores | default(None) }}"
+            cpu_threads: "{{ vs_host.ansible_facts.ansible_processor_vcpus | default(None) }}"
+            memory_mb: "{{ vs_host.ansible_facts.ansible_memtotal_mb | default(None) }}"
+            memory_free_mb: "{{ vs_host.ansible_facts.ansible_memfree_mb | default(None) }}"
+            version: "{{ vs_host.ansible_facts.ansible_distribution_version | default(None) }}"
+          datastores: "{{ vs_ds.datastores | map('dict2items')
+                          | map('selectattr', 'key', 'in', ['name', 'type', 'capacity', 'freeSpace']) | map('items2dict') | list }}"
+          vmnics: "{{ vs_vmnics.hosts_vmnics_info }}"
+          vswitches: "{{ vs_vswitch.hosts_vswitch_info }}"
+          portgroups: "{{ vs_pg.hosts_portgroup_info }}"
+          dvswitches: "{{ vs_dvs.distributed_virtual_switches | default([]) }}"
+          dvportgroups: "{{ vs_dvpg.dvs_portgroup_info | default({}) }}"
+
+- name: AD DNS
+  hosts: localhost
+  gather_facts: false
+  tags: [dns]
+  tasks:
+    - name: Names through the AD DC (cluster zone must not exist yet; internet names must resolve)
+      ansible.builtin.set_fact:
+        discovered_dns:
+          domain_soa: "{{ lookup('community.general.dig', e.jumpbox.search_domain, '@' ~ e.ad.server, qtype='SOA', fail_on_error=false) }}"
+          cluster_zone_soa: "{{ lookup('community.general.dig', e.domain, '@' ~ e.ad.server, qtype='SOA', fail_on_error=false) }}"
+          external:
+            registry.redhat.io: "{{ lookup('community.general.dig', 'registry.redhat.io', '@' ~ e.ad.server, fail_on_error=false) }}"
+            quay.io: "{{ lookup('community.general.dig', 'quay.io', '@' ~ e.ad.server, fail_on_error=false) }}"
+            mirror.openshift.com: "{{ lookup('community.general.dig', 'mirror.openshift.com', '@' ~ e.ad.server, fail_on_error=false) }}"
+    - name: Forward and reverse names of the data-plane hosts in AD
+      ansible.builtin.set_fact:
+        discovered_dns: "{{ discovered_dns | combine({'edpm': discovered_dns.edpm | default({}) | combine({item.name: {
+          'a': lookup('community.general.dig', item.name ~ '.' ~ e.jumpbox.search_domain, '@' ~ e.ad.server, fail_on_error=false),
+          'ptr': lookup('community.general.dig', item.ip ~ '/PTR', '@' ~ e.ad.server, fail_on_error=false)}})}) }}"
+      loop: "{{ e.edpm_hosts }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: WinRM reachable on the DC
+      ansible.builtin.wait_for:
+        host: "{{ e.ad.server }}"
+        port: "{{ e.ad.winrm_port | default(5985) }}"
+        timeout: 5
+      register: winrm_port
+      failed_when: false
+
+- name: AD DC over WinRM
+  hosts: addc
+  gather_facts: false
+  tags: [dns]
+  tasks:
+    - name: WinRM login
+      ansible.windows.win_ping:
+      register: addc_ping
+      ignore_unreachable: true
+      failed_when: false
+
+    - name: Windows facts (domain, OS)
+      ansible.windows.setup:
+        gather_subset: [min]
+      when: addc_ping.ping | default('') == 'pong'
+
+    - name: AD DC summary
+      ansible.builtin.set_fact:
+        discovered:
+          hostname: "{{ ansible_facts.hostname | default('') }}"
+          fqdn: "{{ ansible_facts.fqdn | default('') }}"
+          domain: "{{ ansible_facts.windows_domain | default('') }}"
+          domain_role: "{{ ansible_facts.windows_domain_role | default('') }}"
+          os: "{{ ansible_facts.os_name | default('') }}"
+      when: addc_ping.ping | default('') == 'pong'
+
+- name: Jump box
+  hosts: jumpbox
+  gather_facts: true
+  tags: [jumpbox]
+  tasks:
+    - name: Jump box summary
+      ansible.builtin.set_fact:
+        discovered: "{{ lookup('ansible.builtin.template', repo_root_tpl) | from_yaml }}"
+      vars:
+        repo_root_tpl: "{{ hostvars['localhost'].repo_root }}/roles/env_model/templates/host_facts.yml.j2"
+
+- name: Data-plane hosts
+  hosts: edpm
+  gather_facts: true
+  tags: [edpm]
+  tasks:
+    - name: Subscription certificate
+      ansible.builtin.find:
+        paths: /etc/pki/consumer
+        patterns: cert.pem
+      register: rhsm_cert
+    - name: NetworkManager connection profiles (names only)
+      ansible.builtin.find:
+        paths: [/etc/NetworkManager/system-connections, /etc/sysconfig/network-scripts]
+        patterns: ["*.nmconnection", "ifcfg-*"]
+      register: nm_profiles
+    - name: Services
+      ansible.builtin.service_facts:
+    - name: Host summary
+      ansible.builtin.set_fact:
+        discovered: "{{ lookup('ansible.builtin.template', repo_root_tpl) | from_yaml }}"
+      vars:
+        repo_root_tpl: "{{ hostvars['localhost'].repo_root }}/roles/env_model/templates/host_facts.yml.j2"
+
+- name: Report
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Previous report (a partial run, e.g. --tags edpm, only replaces what it collected)
+      ansible.builtin.slurp:
+        src: "{{ state_dir }}/discovery.yml"
+      register: disc_prev
+      failed_when: false
+
+    - name: Collected in this run
+      ansible.builtin.set_fact:
+        disc_new: >-
+          {%- set d = {} -%}
+          {%- if discovered_vsphere is defined -%}{%- set _ = d.update({'vsphere': discovered_vsphere}) -%}{%- endif -%}
+          {%- if discovered_dns is defined -%}{%- set _ = d.update({'dns': discovered_dns}) -%}{%- endif -%}
+          {%- if winrm_port is defined -%}
+          {%-   set _ = d.update({'winrm_port_open': winrm_port.state | default('') == 'started',
+                                  'winrm_login': (hostvars['addc'].addc_ping.ping | default('')) == 'pong'}) -%}
+          {%- endif -%}
+          {%- if hostvars['addc'].discovered is defined -%}{%- set _ = d.update({'addc': hostvars['addc'].discovered}) -%}{%- endif -%}
+          {%- if hostvars['jumpbox'].discovered is defined -%}{%- set _ = d.update({'jumpbox': hostvars['jumpbox'].discovered}) -%}{%- endif -%}
+          {%- set ed = {} -%}
+          {%- for h in groups['edpm'] if hostvars[h].discovered is defined -%}{%- set _ = ed.update({h: hostvars[h].discovered}) -%}{%- endfor -%}
+          {%- if ed -%}{%- set _ = d.update({'edpm': ed}) -%}{%- endif -%}
+          {{ d }}
+
+    - name: Write .state/<env>/discovery.yml
+      ansible.builtin.copy:
+        dest: "{{ state_dir }}/discovery.yml"
+        mode: "0600"
+        content: |
+          {{ ((disc_prev.content | b64decode | from_yaml) if disc_prev.content is defined else {})
+             | combine(disc_new, recursive=true) | to_nice_yaml(indent=2, width=120) }}

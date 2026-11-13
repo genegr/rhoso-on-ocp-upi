@@ -1,0 +1,17 @@
+# Same toolbox image as ../ocp-upi (built there: docker buildx bake -f compose.yaml --allow=network.host toolbox).
+#   docker compose run --rm toolbox ansible-playbook playbooks/<playbook>.yml -e env=<name>
+# The OCP repo is mounted read-only for the cluster's kubeconfig and oc binary (.state/clusters/<name>/, .state/bin/).
+services:
+  toolbox:
+    image: ocp-upi-toolbox:1
+    network_mode: host
+    user: "${UID:-1000}:${GID:-1000}"
+    working_dir: /work
+    volumes:
+      - ./:/work
+      - ../ocp-upi:/ocp:ro
+    environment:
+      HOME: /work/.state/home
+      ANSIBLE_CONFIG: /work/ansible.cfg
+    stdin_open: true
+    tty: true

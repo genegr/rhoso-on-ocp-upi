@@ -1,0 +1,108 @@
+---
+# Data-plane host preparation (RHOSO 18.0 pre-provisioned nodes): RHEL release lock, exactly the RHOSO repositories,
+# time zone UTC, then align every package with the locked release (dnf distro-sync) and reboot into the new kernel.
+#   ansible-playbook playbooks/edpm_prep.yml -e env=<name> --check --diff     # preview
+#   ansible-playbook playbooks/edpm_prep.yml -e env=<name>                    # lock, repos, UTC; previews distro-sync
+#   ansible-playbook playbooks/edpm_prep.yml -e env=<name> -e distro_sync=true [-e reboot=true]
+# Registration itself is not done here (the hosts are already registered; discover.yml checks it).
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - env_model
+
+- name: Prepare the data-plane hosts
+  hosts: edpm
+  gather_facts: true
+  vars:
+    e: "{{ hostvars['localhost'].e }}"
+    distro_sync: false            # true: run the previewed dnf distro-sync
+    reboot: false                 # true: reboot when the newest installed kernel is not the running one
+    edpm_prep_release: "{{ e.edpm_rhel_release | default('9.6') }}"
+    edpm_prep_repos: "{{ e.edpm_repos | default(['rhel-9-for-x86_64-baseos-eus-rpms',
+                                                 'rhel-9-for-x86_64-appstream-eus-rpms',
+                                                 'rhel-9-for-x86_64-highavailability-eus-rpms',
+                                                 'fast-datapath-for-rhel-9-x86_64-rpms',
+                                                 'rhoso-18.0-for-rhel-9-x86_64-rpms',
+                                                 'rhceph-7-tools-for-rhel-9-x86_64-rpms']) }}"
+    # rhceph-7-tools: ceph-common, installed by the download-cache service on every compute node (Ceph or not).
+  tasks:
+    - name: Release lock
+      community.general.rhsm_release:
+        release: "{{ edpm_prep_release }}"
+
+    - name: Exactly the RHOSO repositories enabled (all others disabled)
+      community.general.rhsm_repository:
+        name: "{{ edpm_prep_repos }}"
+        state: enabled
+        purge: true
+
+    - name: Time zone UTC
+      community.general.timezone:
+        name: UTC
+
+    - name: Preview dnf distro-sync against the locked release
+      ansible.builtin.command:
+        argv: [dnf, distro-sync, --assumeno, --refresh]
+      register: edpm_prep_ds_preview
+      changed_when: false
+      failed_when: edpm_prep_ds_preview.rc not in [0, 1]
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Distro-sync needed?
+      ansible.builtin.set_fact:
+        edpm_prep_ds_needed: "{{ 'Nothing to do' not in edpm_prep_ds_preview.stdout }}"
+        edpm_prep_ds_summary: >-
+          {%- set out = {'summary': [], 'Installing': [], 'Downgrading': [], 'Removing': []} -%}
+          {%- set ns = namespace(sec='') -%}
+          {%- for l in edpm_prep_ds_preview.stdout_lines -%}
+          {%-   if l is match('^(Install|Upgrade|Downgrade|Remove|Reinstall)\s+\d+') -%}{%- set _ = out.summary.append(l | trim) -%}
+          {%-   elif l is match('^[A-Z][a-z]+( [a-z ]+)?:$') -%}{%- set ns.sec = l.split(' ')[0] | replace(':', '') -%}
+          {%-   elif ns.sec in ['Installing', 'Downgrading', 'Removing'] and l is match('^ \S') -%}
+          {%-     set _ = out[ns.sec].append(l.split()[0] ~ ' ' ~ (l.split()[2] | default(''))) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ out }}
+      when: edpm_prep_ds_preview.stdout is defined
+
+    - name: Transaction preview
+      ansible.builtin.debug:
+        msg: "{{ edpm_prep_ds_summary | default([]) if edpm_prep_ds_needed | default(false) else 'nothing to do' }}"
+
+    - name: dnf distro-sync
+      ansible.builtin.command:
+        argv: [dnf, distro-sync, -y]
+      when: distro_sync | bool and edpm_prep_ds_needed | default(false)
+      changed_when: true
+
+    - name: Installed packages
+      ansible.builtin.package_facts:
+
+    # Hosts installed with a smaller package set get what the reference host has (names only: versions come from the
+    # locked repos). Nothing is removed. Boot-loader packages depend on the firmware mode, so they are left alone.
+    - name: Packages the reference host has and this host lacks
+      ansible.builtin.set_fact:
+        edpm_prep_missing: "{{ hostvars[e.edpm_align.reference].ansible_facts.packages.keys()
+                               | difference(ansible_facts.packages.keys())
+                               | reject('match', e.edpm_align.exclude | default('^(gpg-pubkey|kernel.*|shim.*|grub2-(efi|pc).*|mokutil|efibootmgr|efi-filesystem|efivar.*)$'))
+                               | sort }}"
+      when:
+        - e.edpm_align is defined
+        - inventory_hostname in e.edpm_align.hosts
+        - e.edpm_align.reference in ansible_play_hosts
+
+    - name: Install them
+      ansible.builtin.dnf:
+        name: "{{ edpm_prep_missing }}"
+        state: present
+      when: edpm_prep_missing | default([]) | length > 0
+
+    - name: Reboot into the newest installed kernel
+      ansible.builtin.reboot:
+        reboot_timeout: 1800
+      when:
+        - reboot | bool
+        - ansible_facts.packages.kernel is defined
+        - (ansible_facts.packages.kernel | map(attribute='version') | zip(ansible_facts.packages.kernel | map(attribute='release'))
+           | map('join', '-') | community.general.version_sort | last) ~ '.' ~ ansible_facts.architecture != ansible_facts.kernel

@@ -1,0 +1,88 @@
+---
+# Load envs/<env>.yaml as `e`, the vault, and register the run-time hosts:
+#   jumpbox (ssh), edpm (group, ssh root), addc (WinRM).
+- name: The environment is selected explicitly
+  ansible.builtin.assert:
+    that: env is defined
+    fail_msg: "Pass -e env=<name> (envs/<name>.yaml)"
+    quiet: true
+
+- name: Paths
+  ansible.builtin.set_fact:
+    repo_root: "{{ inventory_dir | dirname }}"
+    env_file: "{{ inventory_dir | dirname }}/envs/{{ env }}.yaml"
+    state_dir: "{{ inventory_dir | dirname }}/.state/{{ env }}"
+    ssh_key: "{{ inventory_dir | dirname }}/.state/ssh/id_ed25519"
+
+- name: Read the environment
+  ansible.builtin.include_vars:
+    file: "{{ env_file }}"
+    name: e
+
+- name: The file is named after its environment
+  ansible.builtin.assert:
+    that: e.env == env
+    fail_msg: "{{ env_file }} defines env '{{ e.env }}', not '{{ env }}'"
+    quiet: true
+
+- name: State directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ state_dir }}"
+    - "{{ ssh_key | dirname }}"
+
+- name: Toolbox SSH key (add the .pub to the jump box user's authorized_keys once)
+  community.crypto.openssh_keypair:
+    path: "{{ ssh_key }}"
+    type: ed25519
+    comment: rhoso-toolbox
+
+- name: Look for the vault
+  ansible.builtin.stat:
+    path: "{{ repo_root }}/envs/vault.yml"
+  register: vault_file
+
+- name: Load the vault
+  ansible.builtin.include_vars:
+    file: "{{ repo_root }}/envs/vault.yml"
+  when: vault_file.stat.exists
+  no_log: true
+
+- name: Register the jump box
+  ansible.builtin.add_host:
+    name: jumpbox
+    ansible_host: "{{ e.jumpbox.ip }}"
+    ansible_user: "{{ e.jumpbox.user }}"
+    ansible_ssh_private_key_file: "{{ ssh_key }}"
+    ansible_become: true
+  changed_when: false
+
+- name: Register the data-plane hosts
+  ansible.builtin.add_host:
+    name: "{{ item.name }}"
+    groups: [edpm]
+    ansible_host: "{{ item.ip }}"
+    ansible_user: root
+    ansible_ssh_private_key_file: "{{ ssh_key }}"
+    edpm: "{{ item }}"
+  loop: "{{ e.edpm_hosts }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+- name: Register the AD domain controller (WinRM)
+  ansible.builtin.add_host:
+    name: addc
+    ansible_host: "{{ e.ad.server }}"
+    ansible_connection: winrm
+    ansible_port: "{{ e.ad.winrm_port | default(5985) }}"
+    ansible_winrm_transport: "{{ e.ad.winrm_transport | default('ntlm') }}"
+    ansible_winrm_scheme: "{{ 'https' if (e.ad.winrm_port | default(5985)) | int == 5986 else 'http' }}"
+    ansible_winrm_server_cert_validation: ignore
+    ansible_user: "{{ vault_ad_user | default('') }}"
+    ansible_password: "{{ vault_ad_password | default('') }}"
+  changed_when: false
+  no_log: true

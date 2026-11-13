@@ -1,0 +1,144 @@
+---
+# Read-only audit of the data-plane hosts: are they identical (OS, kernel, packages, repos, firmware) and do they meet
+# the RHOSO 18.0 pre-provisioned node prerequisites (docs/network-requirements.md V2)?
+# Report: .state/<env>/host-audit.md.
+#   ansible-playbook playbooks/host_audit.yml -e env=<name> [-e audit_updates=false]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - env_model
+
+- name: Collect
+  hosts: edpm
+  gather_facts: true
+  vars:
+    audit_updates: true           # also list pending updates from the enabled repos (refreshes dnf metadata)
+  tasks:
+    - name: Installed packages
+      ansible.builtin.package_facts:
+
+    - name: Services
+      ansible.builtin.service_facts:
+
+    - name: Subscription files (release lock, repos, entitlement)
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - /var/lib/rhsm/cache/releasever.json
+        - /etc/yum.repos.d/redhat.repo
+        - /etc/dnf/vars/releasever
+        - /proc/cpuinfo
+        - /etc/adjtime
+      register: audit_files
+      failed_when: false
+
+    - name: Subscription certificate
+      ansible.builtin.find:
+        paths: /etc/pki/consumer
+        patterns: cert.pem
+      register: audit_rhsm_cert
+
+    - name: KVM device
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: audit_kvm
+
+    - name: cloud-admin user
+      ansible.builtin.getent:
+        database: passwd
+        key: cloud-admin
+        fail_key: false
+
+    - name: Sudoers drop-ins
+      ansible.builtin.find:
+        paths: /etc/sudoers.d
+      register: audit_sudoers
+
+    - name: Pending updates from the enabled repos
+      ansible.builtin.dnf:
+        list: updates
+      register: audit_updates_list
+      when: audit_updates | bool
+      failed_when: false
+
+    - name: Host summary
+      ansible.builtin.set_fact:
+        audit: >-
+          {%- set f = {} -%}
+          {%- for r in audit_files.results if r.content is defined -%}
+          {%-   set _ = f.update({r.item: r.content | b64decode}) -%}
+          {%- endfor -%}
+          {%- set repo = f['/etc/yum.repos.d/redhat.repo'] | default('') -%}
+          {%- set enabled = [] -%}
+          {%- for sec in repo.split('\n[') -%}
+          {%-   set name = sec | regex_search('^\\[?([^\\]\\n]+)\\]', '\\1') -%}
+          {%-   if name and (sec | regex_search('(?m)^enabled\\s*=\\s*1')) -%}{%- set _ = enabled.append(name | first) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- set pk = {} -%}
+          {%- for n, l in ansible_facts.packages.items() -%}
+          {%-   set _ = pk.update({n: l | map(attribute='version') | zip(l | map(attribute='release'), l | map(attribute='arch'))
+                                        | map('join', '|') | map('replace', '|', '-', 1) | map('replace', '|', '.') | sort | join(' ')}) -%}
+          {%- endfor -%}
+          {%- set cpu = f['/proc/cpuinfo'] | default('') -%}
+          {{ {
+            'os': ansible_facts.distribution ~ ' ' ~ ansible_facts.distribution_version,
+            'kernel': ansible_facts.kernel,
+            'releasever_lock': (f['/var/lib/rhsm/cache/releasever.json'] | default('{}') | from_json).releaseVer | default(''),
+            'dnf_releasever_var': f['/etc/dnf/vars/releasever'] | default('') | trim,
+            'subscribed': audit_rhsm_cert.matched > 0,
+            'repos': enabled | sort,
+            'vendor': ansible_facts.system_vendor ~ ' ' ~ ansible_facts.product_name,
+            'bios': ansible_facts.bios_version | default(''),
+            'cpu_model': (ansible_facts.processor | select('match', '.*(Intel|AMD).*') | first) | default(''),
+            'cpu_sockets': ansible_facts.processor_count,
+            'cpu_cores': ansible_facts.processor_cores,
+            'cpu_threads': ansible_facts.processor_vcpus,
+            'virt_flag': 'vmx' if ' vmx' in cpu else ('svm' if ' svm' in cpu else 'none'),
+            'kvm_dev': audit_kvm.stat.exists,
+            'memory_gb': (ansible_facts.memtotal_mb / 1024) | round(0) | int,
+            'disks': ansible_facts.devices | dict2items | rejectattr('key', 'match', '^(loop|dm-|sr|zram)')
+                     | map(attribute='key') | zip(ansible_facts.devices | dict2items | rejectattr('key', 'match', '^(loop|dm-|sr|zram)')
+                     | map(attribute='value.size')) | map('join', ' ') | list,
+            'timezone': ansible_facts.date_time.tz | default(''),
+            'rtc': (f['/etc/adjtime'] | trim).splitlines() | last if f['/etc/adjtime'] is defined else 'UTC (no /etc/adjtime)',
+            'repos_available': repo | regex_findall('(?m)^[[]([^]]+)[]]') | sort,
+            'selinux': ansible_facts.selinux.status ~ '/' ~ (ansible_facts.selinux.mode | default('')),
+            'fips': ansible_facts.fips | default(false),
+            'cmdline': ansible_facts.proc_cmdline | default({}) | dict2items | rejectattr('key', 'in', ['BOOT_IMAGE', 'root', 'ro', 'rd.lvm.lv', 'resume']) | items2dict,
+            'services': {
+              'NetworkManager': (ansible_facts.services['NetworkManager.service'] | default({})).state | default('absent'),
+              'firewalld': (ansible_facts.services['firewalld.service'] | default({})).state | default('absent'),
+              'chronyd': (ansible_facts.services['chronyd.service'] | default({})).state | default('absent'),
+              'iscsid': (ansible_facts.services['iscsid.service'] | default({})).state | default('absent'),
+              'multipathd': (ansible_facts.services['multipathd.service'] | default({})).state | default('absent'),
+              'libvirtd': (ansible_facts.services['libvirtd.service'] | default({})).state | default('absent'),
+              'openvswitch': (ansible_facts.services['openvswitch.service'] | default({})).state | default('absent')},
+            'cloud_admin': 'cloud-admin' in (ansible_facts.getent_passwd | default({})),
+            'sudoers': audit_sudoers.files | map(attribute='path') | map('basename') | list,
+            'updates': (audit_updates_list.results | default([]) | map(attribute='name') | unique | list) if audit_updates | bool else none,
+            'packages': pk} }}
+
+- name: Report
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Criteria: RHOSO 18.0 "Creating the data plane" (pre-provisioned nodes: release lock, these repos, an SSH user
+    # with passwordless sudo) and the Red Hat assistant's requirements summary (RHEL 9.2/9.4/9.6, NTP, OS time zone and
+    # firmware clock in UTC). rhceph-*-tools only with Ceph, so not required here.
+    audit_rhel_minors: ["9.2", "9.4", "9.6"]
+    audit_required_repos:
+      - rhel-9-for-x86_64-baseos-eus-rpms
+      - rhel-9-for-x86_64-appstream-eus-rpms
+      - rhel-9-for-x86_64-highavailability-eus-rpms
+      - fast-datapath-for-rhel-9-x86_64-rpms
+      - rhoso-18.0-for-rhel-9-x86_64-rpms
+    audit_key_packages: [redhat-release, kernel, podman, NetworkManager, nmstate, os-net-config, openvswitch3.3, openvswitch3.5,
+                         libvirt-daemon, iscsi-initiator-utils, device-mapper-multipath, chrony, firewalld, tuned,
+                         python3, sudo, lvm2]
+  tasks:
+    - name: Write .state/<env>/host-audit.md
+      ansible.builtin.template:
+        src: templates/host-audit.md.j2
+        dest: "{{ state_dir }}/host-audit.md"
+        mode: "0600"

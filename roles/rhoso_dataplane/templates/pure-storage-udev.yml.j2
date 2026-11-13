@@ -1,0 +1,20 @@
+- name: Everpure/Pure FlashArray udev rules
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: /etc/udev/rules.d/99-pure-storage.rules
+      ansible.builtin.copy:
+        dest: /etc/udev/rules.d/99-pure-storage.rules
+        mode: "0644"
+        content: |
+          {{ lookup('ansible.builtin.file', '/ocp/roles/storage_node/files/99-pure-storage.rules') | indent(10) }}
+      register: pure_rules
+
+    - name: Reload the udev rules
+      ansible.builtin.command: udevadm control --reload-rules
+      when: pure_rules is changed
+
+    - name: Apply them to existing block devices
+      ansible.builtin.command: udevadm trigger --subsystem-match=block --action=change
+      when: pure_rules is changed

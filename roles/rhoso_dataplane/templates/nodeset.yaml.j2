@@ -1,0 +1,143 @@
+{#- OpenStackDataPlaneNodeSet (pre-provisioned): architecture lib/dataplane/nodeset + examples/va/hci nodeset values,
+    adapted: management (native VLAN of the bond) keeps its address and the default route on br-ex; ctlplane,
+    internalapi and tenant are VLAN ports on br-ex; the iSCSI NICs carry storage / storage2. -#}
+{%- set nets = e.rhoso.networks | map(attribute='name') | list -%}
+{%- set mgmt_prefix = dp.mgmt.cidr.split('/')[1] -%}
+apiVersion: dataplane.openstack.org/v1beta1
+kind: OpenStackDataPlaneNodeSet
+metadata:
+  name: {{ dp.nodeset }}
+  namespace: {{ rhoso_namespace }}
+spec:
+  env:
+    - name: ANSIBLE_FORCE_COLOR
+      value: "True"
+  preProvisioned: true
+  networkAttachments:
+    - ctlplane
+  services:
+    - bootstrap
+    - download-cache
+    - configure-network
+    - validate-network
+    - install-os
+    - configure-os
+    - pure-storage-udev
+    - ssh-known-hosts
+    - run-os
+    - reboot-os
+    - install-certs
+    - ovn
+    - neutron-metadata
+    - libvirt
+    - nova
+  nodeTemplate:
+    ansibleSSHPrivateKeySecret: dataplane-ansible-ssh-private-key-secret
+    managementNetwork: ctlplane
+    networks:
+{% for n in nets %}
+      - name: {{ n }}
+        subnetName: subnet1
+{% endfor %}
+    extraMounts:
+      - extraVolType: Multipath
+        volumes:
+          - name: edpm-multipath
+            configMap:
+              name: edpm-multipath
+        mounts:
+          - name: edpm-multipath
+            mountPath: /runner/multipath
+            readOnly: true
+    ansible:
+      ansibleUser: root
+      ansiblePort: 22
+      ansibleVarsFrom:
+        - secretRef:
+            name: redhat-registry
+      ansibleVars:
+        gather_facts: false
+        timesync_ntp_servers:
+{% for s in dp.ntp_servers %}
+          - hostname: {{ s }}
+{% endfor %}
+        edpm_sshd_configure_firewall: true
+        edpm_sshd_allowed_ranges: {{ dp.sshd_allowed_ranges | to_json }}
+        edpm_nodes_validation_validate_controllers_icmp: false
+        edpm_nodes_validation_validate_gateway_icmp: false
+        edpm_network_config_hide_sensitive_logs: false
+        neutron_physical_bridge_name: br-ex
+        neutron_public_interface_name: bond0
+        edpm_enable_chassis_gw: true
+        edpm_multipathd_custom_config_file: multipath.conf
+        edpm_mgmt_prefix: "{{ mgmt_prefix }}"
+        edpm_mgmt_gateway: {{ dp.mgmt.gateway }}
+        edpm_bond_options: "{{ dp.bond_options }}"
+        edpm_network_config_template: |
+          ---
+{% raw %}
+          network_config:
+          - type: ovs_bridge
+            name: {{ neutron_physical_bridge_name }}
+            mtu: 9000
+            use_dhcp: false
+            dns_servers: {{ ctlplane_dns_nameservers }}
+            domain: {{ dns_search_domains }}
+            addresses:
+            - ip_netmask: {{ edpm_mgmt_ip }}/{{ edpm_mgmt_prefix }}
+            routes:
+            - default: true
+              next_hop: {{ edpm_mgmt_gateway }}
+            members:
+            - type: linux_bond
+              name: bond0
+              mtu: 9000
+              bonding_options: "{{ edpm_bond_options }}"
+              use_dhcp: false
+              members:
+              - type: interface
+                name: {{ edpm_bond_nics[0] }}
+                mtu: 9000
+                primary: true
+              - type: interface
+                name: {{ edpm_bond_nics[1] }}
+                mtu: 9000
+            - type: vlan
+              vlan_id: {{ ctlplane_vlan_id }}
+              mtu: {{ ctlplane_mtu }}
+              addresses:
+              - ip_netmask: {{ ctlplane_ip }}/{{ ctlplane_cidr }}
+          {% for network in ['internalapi', 'tenant'] %}
+            - type: vlan
+              vlan_id: {{ lookup('vars', network ~ '_vlan_id') }}
+              mtu: {{ lookup('vars', network ~ '_mtu') }}
+              addresses:
+              - ip_netmask: {{ lookup('vars', network ~ '_ip') }}/{{ lookup('vars', network ~ '_cidr') }}
+          {% endfor %}
+          {% for network, nic in [['storage', edpm_iscsi_nics[0]], ['storage2', edpm_iscsi_nics[1]]] %}
+          - type: interface
+            name: {{ nic }}
+            mtu: {{ lookup('vars', network ~ '_mtu') }}
+            use_dhcp: false
+            addresses:
+            - ip_netmask: {{ lookup('vars', network ~ '_ip') }}/{{ lookup('vars', network ~ '_cidr') }}
+          {% endfor %}
+{% endraw %}
+  nodes:
+{% for h in e.edpm_hosts %}
+{%   set hostnum = h.ip.split('.')[-1] %}
+    {{ h.name }}:
+      hostName: {{ h.name }}
+      ansible:
+        ansibleHost: {{ (e.rhoso.networks | selectattr('name', 'equalto', 'ctlplane') | first).cidr.split('/')[0].rsplit('.', 1)[0] }}.{{ hostnum }}
+        ansibleVars:
+          edpm_mgmt_ip: {{ h.ip }}
+          edpm_bond_nics: {{ dp.models[h.model].bond_nics | to_json }}
+          edpm_iscsi_nics: {{ h.iscsi_nics | to_json }}
+      networks:
+{%   for net in e.rhoso.networks %}
+        - name: {{ net.name }}
+          subnetName: subnet1
+          fixedIP: {{ net.cidr.split('/')[0].rsplit('.', 1)[0] }}.{{ hostnum }}
+{%   endfor %}
+{% endfor %}

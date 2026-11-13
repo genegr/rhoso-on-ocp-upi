@@ -1,0 +1,43 @@
+---
+# Pre-provisioned data-plane prerequisite (Deploying RHOSO 18.0, "pre-provisioned nodes": the ctlplane IP is configured
+# before the deployment and Ansible reaches the node on it): one NetworkManager VLAN connection per host on the
+# management bond, ctlplane network (e.rhoso.networks ctlplane), address = the host's management host number,
+# no gateway, no DNS. Existing connections are never modified. os-net-config (configure-network) replaces it later.
+# Changes bare-metal host networking: --check --diff first and the user's go-ahead.
+#   ansible-playbook playbooks/edpm_ctlplane.yml -e env=<name> [-l <host>] [--check --diff]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - env_model
+
+- name: ctlplane VLAN on the data-plane hosts
+  hosts: edpm
+  gather_facts: false
+  vars:
+    net: "{{ hostvars['localhost'].e.rhoso.networks | selectattr('name', 'equalto', 'ctlplane') | first }}"
+    parent: "{{ edpm.trunk_nic | default('bond0') }}"
+    ctlplane_ip: "{{ net.cidr.split('/')[0].rsplit('.', 1)[0] }}.{{ ansible_host.split('.')[-1] }}"
+  tasks:
+    - name: Connection rhoso-ctlplane ({{ parent }}.{{ net.vlan }})
+      community.general.nmcli:
+        conn_name: rhoso-ctlplane
+        type: vlan
+        vlandev: "{{ parent }}"
+        vlanid: "{{ net.vlan }}"
+        ifname: "{{ parent }}.{{ net.vlan }}"
+        ip4: "{{ ctlplane_ip }}/{{ net.cidr.split('/')[1] }}"
+        method4: manual
+        never_default4: true
+        dns4_ignore_auto: true
+        method6: disabled
+        mtu: "{{ net.mtu }}"
+        autoconnect: true
+        state: present
+
+    - name: ctlplane address is up
+      ansible.builtin.wait_for:
+        host: "{{ ctlplane_ip }}"
+        port: 22
+        timeout: 30
+      when: not ansible_check_mode

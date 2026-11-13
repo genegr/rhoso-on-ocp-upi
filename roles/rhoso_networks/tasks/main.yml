@@ -1,0 +1,182 @@
+---
+# Deploying RHOSO 18.0, "Preparing networks for Red Hat OpenStack Services on OpenShift": per OCP node an NNCP with
+# its address on each isolated network, a macvlan NetworkAttachmentDefinition (whereabouts IPAM) per network, MetalLB
+# L2 pools + advertisements, and the NetConfig the data plane allocates from (e.rhoso.networks, e.rhoso.ranges).
+# The masters' iSCSI NICs (networks with ocp_ip_owner: ocp-storage) are configured by the OCP repo's storage phase.
+- name: Nodes and their interfaces
+  ansible.builtin.include_tasks: ifaces.yml
+
+- name: Networks
+  ansible.builtin.set_fact:
+    # Defaults per network: a NAD and a MetalLB pool, OCP node addresses from this phase.
+    rn_nets: "{{ [{'nad': true, 'metallb': true, 'ocp_ip_owner': ''}] | product(e.rhoso.networks) | map('combine') | list }}"
+    rn_domain: "{{ e.domain }}"
+
+- name: Every network is a /24 (host numbers are mirrored across subnets)
+  ansible.builtin.assert:
+    that: item.cidr is match('^[0-9.]+\.0/24$')
+    fail_msg: "{{ item.name }}: {{ item.cidr }} is not a /24"
+    quiet: true
+  loop: "{{ rn_nets }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Interface per node and network
+  ansible.builtin.set_fact:
+    rn_ifaces: >-
+      {%- set out = {} -%}
+      {%- for node, pgs in rn_pg_ifaces.items() -%}
+      {%-   set m = {} -%}
+      {%-   for net in rn_nets -%}{%- set _ = m.update({net.name: pgs[net.ocp_portgroup]}) -%}{%- endfor -%}
+      {%-   set _ = out.update({node: m}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+# A macvlan NAD names one master interface for all nodes.
+- name: Each network has the same interface name on every node
+  ansible.builtin.assert:
+    that: rn_ifaces.values() | map(attribute=item.name) | unique | list | length == 1
+    fail_msg: "{{ item.name }}: interface names differ between nodes: {{ rn_ifaces }}"
+    quiet: true
+  loop: "{{ rn_nets }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ (rn_ifaces.values() | first)[item.name] }}"
+
+- name: Derived objects
+  ansible.builtin.set_fact:
+    rn_iface: "{{ rn_ifaces.values() | first }}"
+    rn_nncps: >-
+      {%- set out = [] -%}
+      {%- for n in rn_nodes -%}
+      {%-   set ifs = [] -%}
+      {%-   for net in rn_nets if net.ocp_ip_owner != 'ocp-storage' -%}
+      {%-     set _ = ifs.append({'name': rn_ifaces[n.name][net.name], 'description': 'RHOSO ' ~ net.name,
+                                  'type': 'ethernet', 'state': 'up', 'mtu': net.mtu,
+                                  'ipv4': {'enabled': true, 'dhcp': false,
+                                           'address': [{'ip': net.cidr.split('/')[0].rsplit('.', 1)[0] ~ '.' ~ n.ip.split('.')[-1],
+                                                        'prefix-length': 24}]},
+                                  'ipv6': {'enabled': false}}) -%}
+      {%-   endfor -%}
+      {%-   set _ = out.append({'name': 'rhoso-' ~ n.name, 'node': n.hostname, 'spec': {
+                                 'nodeSelector': {'kubernetes.io/hostname': n.hostname},
+                                 'desiredState': {'interfaces': ifs}}}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Existing RHOSO NNCPs
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: "{{ item.name }}"
+  loop: "{{ rn_nncps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: nncp_now
+
+# NMState's webhook stamps the policy on every update: apply only when the spec differs (idempotent).
+- name: NNCP per node (addresses on ctlplane, internalapi, tenant)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NodeNetworkConfigurationPolicy
+      metadata:
+        name: "{{ item.0.name }}"
+      spec: "{{ item.0.spec }}"
+  loop: "{{ rn_nncps | zip(nncp_now.results) | list }}"
+  loop_control:
+    label: "{{ item.0.name }}"
+  when: >-
+    item.1.resources | length == 0
+    or item.1.resources[0].spec.desiredState != item.0.spec.desiredState
+    or item.1.resources[0].spec.nodeSelector != item.0.spec.nodeSelector
+
+- name: NNCPs Available
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: "{{ item.name }}"
+  loop: "{{ rn_nncps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: nncp_state
+  until: >-
+    (nncp_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Available')
+     | map(attribute='status') | first | default('')) == 'True'
+  retries: 60
+  delay: 10
+  when: not ansible_check_mode
+
+- name: NetworkAttachmentDefinitions (macvlan, whereabouts)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: k8s.cni.cncf.io/v1
+      kind: NetworkAttachmentDefinition
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ rhoso_namespace }}"
+        labels:
+          osp/net: "{{ item.name }}"
+      spec:
+        config: >-
+          {{ {'cniVersion': '0.3.1', 'name': item.name, 'type': 'macvlan', 'master': rn_iface[item.name],
+              'ipam': {'type': 'whereabouts', 'range': item.cidr,
+                       'range_start': item.cidr.split('/')[0].rsplit('.', 1)[0] ~ '.' ~ e.rhoso.ranges.nad[0],
+                       'range_end': item.cidr.split('/')[0].rsplit('.', 1)[0] ~ '.' ~ e.rhoso.ranges.nad[1]}}
+             | to_json }}
+  loop: "{{ rn_nets | selectattr('nad') | list }}"
+  loop_control:
+    label: "{{ item.name }} on {{ rn_iface[item.name] }}"
+
+- name: MetalLB address pools
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: "{{ item.name }}"
+        namespace: metallb-system
+      spec:
+        addresses:
+          - "{{ item.cidr.split('/')[0].rsplit('.', 1)[0] ~ '.' ~ e.rhoso.ranges.metallb[0] }}-{{ item.cidr.split('/')[0].rsplit('.', 1)[0] ~ '.' ~ e.rhoso.ranges.metallb[1] }}"
+        autoAssign: true
+        avoidBuggyIPs: false
+  loop: "{{ rn_nets | selectattr('metallb') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: MetalLB L2 advertisements (on that network's interface)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: "{{ item.name }}"
+        namespace: metallb-system
+      spec:
+        ipAddressPools: ["{{ item.name }}"]
+        interfaces: ["{{ rn_iface[item.name] }}"]
+  loop: "{{ rn_nets | selectattr('metallb') | list }}"
+  loop_control:
+    label: "{{ item.name }} on {{ rn_iface[item.name] }}"
+
+- name: NetConfig (data-plane IPAM)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: network.openstack.org/v1beta1
+      kind: NetConfig
+      metadata:
+        name: openstacknetconfig
+        namespace: "{{ rhoso_namespace }}"
+      spec:
+        networks: >-
+          {%- set out = [] -%}
+          {%- for net in rn_nets -%}
+          {%-   set base = net.cidr.split('/')[0].rsplit('.', 1)[0] -%}
+          {%-   set subnet = {'name': 'subnet1', 'cidr': net.cidr,
+                              'allocationRanges': [{'start': base ~ '.' ~ e.rhoso.ranges.allocation[0],
+                                                    'end': base ~ '.' ~ e.rhoso.ranges.allocation[1]}]} -%}
+          {%-   if net.vlan -%}{%- set _ = subnet.update({'vlan': net.vlan}) -%}{%- endif -%}
+          {%-   set _ = out.append({'name': net.name, 'dnsDomain': net.name ~ '.' ~ rn_domain, 'mtu': net.mtu,
+                                    'subnets': [subnet]}) -%}
+          {%- endfor -%}
+          {{ out }}

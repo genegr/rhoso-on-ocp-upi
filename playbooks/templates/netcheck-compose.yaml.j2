@@ -1,0 +1,29 @@
+# Managed by rhoso-on-ocp-upi netcheck.yml - temporary, removed by its cleanup.
+# One probe container with a macvlan leg (own locally administered MAC) per test network: the same kind of extra
+# MAC a macvlan NAD puts on an OCP node's vNIC, so a reply proves VLAN delivery and the port group security policy.
+name: rhoso-netcheck
+services:
+  probe:
+    image: ocp-upi-toolbox:1
+    entrypoint: ["sleep", "infinity"]
+    user: "0:0"
+    networks:
+{% for n in e.jumpbox.test_nics if n.probe | default(true) %}
+      {{ n.network }}:
+        ipv4_address: {{ e.netcheck.probe_ips[n.network] }}
+        mac_address: "{{ '02:52:48:00:00:%02x' | format(loop.index) }}"
+{% endfor %}
+networks:
+{% for n in e.jumpbox.test_nics if n.probe | default(true) %}
+  {{ n.network }}:
+    driver: macvlan
+    driver_opts:
+      parent: {{ n.ifname }}{{ '.' ~ n.vlan if n.vlan else '' }}
+      macvlan_mode: bridge
+    ipam:
+      config:
+        - subnet: {{ e.networks[n.network].cidr }}
+{% if e.networks[n.network].gateway is defined %}
+          gateway: {{ e.networks[n.network].gateway }}
+{% endif %}
+{% endfor %}

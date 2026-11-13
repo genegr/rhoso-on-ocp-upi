@@ -1,0 +1,49 @@
+---
+# RHOSO 18.0 on the OpenShift cluster e.ocp_cluster (built by ../ocp-upi), phase by phase (tags):
+#   operators   NMState check, MetalLB, cert-manager, OVN-K ipForwarding Global, openstack-operator + OpenStack CR
+#   networks    NNCP per OCP node, NADs (macvlan + whereabouts), MetalLB pools/L2Advertisements, NetConfig
+#   flasharray  dedicated array user for Cinder (shared array: --check first, user's go-ahead)
+#   controlplane osp-secret, Pure back end secret, OpenStackVersion (Pure image), OpenStackControlPlane
+#   dataplane   secrets, Pure multipath/udev + Nova multipath services, node set, deployment
+#               (rewrites the hosts' networking: -e dataplane_limit=<host> first, with the user's go-ahead)
+#   ansible-playbook playbooks/rhoso.yml -e env=<name> [--tags <phase>] [--check --diff]
+# The kubeconfig comes read-only from the OCP repo (mounted at /ocp by compose.yaml).
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  roles:
+    - env_model
+
+- name: RHOSO
+  hosts: localhost
+  gather_facts: false
+  vars:
+    rhoso_namespace: openstack            # namespace of the control plane and data plane CRs
+  environment:
+    K8S_AUTH_KUBECONFIG: "/ocp/.state/clusters/{{ e.ocp_cluster }}/install/auth/kubeconfig"
+  tasks:
+    - name: Operators
+      ansible.builtin.import_role:
+        name: rhoso_operators
+      tags: [operators]
+
+    - name: Networks
+      ansible.builtin.import_role:
+        name: rhoso_networks
+      tags: [networks]
+
+    - name: FlashArray user for Cinder
+      ansible.builtin.import_role:
+        name: rhoso_flasharray
+      tags: [flasharray]
+
+    - name: Control plane
+      ansible.builtin.import_role:
+        name: rhoso_controlplane
+      tags: [controlplane]
+
+    - name: Data plane
+      ansible.builtin.import_role:
+        name: rhoso_dataplane
+      tags: [dataplane]
