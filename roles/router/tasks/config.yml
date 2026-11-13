@@ -4,8 +4,14 @@
   vyos.vyos.vyos_config:
     lines: "{{ hostvars['localhost'].rt_lines }}"
     match: line
-    save: true
   register: rt_cfg
+
+# save: true reports changed on every run (its "compare saved" output carries a terminal escape), so save only
+# after a real change.
+- name: Save it
+  vyos.vyos.vyos_config:
+    save: true
+  when: rt_cfg is changed
 
 - name: Checks (read-only)
   vyos.vyos.vyos_command:

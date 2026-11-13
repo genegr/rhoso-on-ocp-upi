@@ -28,20 +28,27 @@
     quiet: true
 
 # The whole desired router configuration, as VyOS prints it in `show configuration commands` (values quoted) so that
-# vyos_config compares line by line and a second run reports changed=0.
+# vyos_config compares line by line and a second run reports changed=0. Leaf values are printed quoted, tag-node
+# names unquoted (`service ntp server <name>`, `static route <prefix> next-hop <address>`): quoting those made every
+# run "changed" (found on the first deploy).
 - name: Desired configuration
   ansible.builtin.set_fact:
     rt_lines: >-
       {%- set L = [] -%}
+      {#- Image defaults that conflict: DHCP on eth0 (a second, lease address on the lab LAN), the VyOS NTP pool. -#}
+      {%- set _ = L.append("delete interfaces ethernet eth0 address 'dhcp'") -%}
+      {%- for n in ['time1.vyos.net', 'time2.vyos.net', 'time3.vyos.net'] if n not in rt.ntp_servers | default([]) -%}
+      {%-   set _ = L.append("delete service ntp server " ~ n) -%}
+      {%- endfor -%}
       {%- set _ = L.append("set system host-name '" ~ rt.name ~ "'") -%}
       {%- for d in rt_dns -%}{%- set _ = L.append("set system name-server '" ~ d ~ "'") -%}{%- endfor -%}
-      {%- for n in rt.ntp_servers | default([]) -%}{%- set _ = L.append("set service ntp server '" ~ n ~ "'") -%}{%- endfor -%}
+      {%- for n in rt.ntp_servers | default([]) -%}{%- set _ = L.append("set service ntp server " ~ n) -%}{%- endfor -%}
       {%- set _ = L.append("set service ssh disable-password-authentication") -%}
       {%- set _ = L.append("set interfaces ethernet eth0 address '" ~ rt.mgmt.ip ~ "/" ~ rt_prefix ~ "'") -%}
       {%- set _ = L.append("set interfaces ethernet eth0 description 'lab LAN (" ~ rt.mgmt.portgroup ~ ")'") -%}
       {%- set _ = L.append("set interfaces ethernet eth1 address '" ~ rt_ext_ip ~ "/" ~ rt_ext_cidr.split('/')[1] ~ "'") -%}
       {%- set _ = L.append("set interfaces ethernet eth1 description 'RHOSO external network (" ~ rt.external_portgroup ~ ")'") -%}
-      {%- set _ = L.append("set protocols static route 0.0.0.0/0 next-hop '" ~ rt_gateway ~ "'") -%}
+      {%- set _ = L.append("set protocols static route 0.0.0.0/0 next-hop " ~ rt_gateway) -%}
       {#- Source NAT: the VMs (floating IPs and router SNAT addresses) leave through eth0 as the router's address,
           except toward the allowed lab networks, which see the floating IPs as they are. -#}
       {%- for s in rt.allowed_sources -%}

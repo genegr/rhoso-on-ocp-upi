@@ -34,12 +34,15 @@
     rt: "{{ hostvars['localhost'].rt }}"
     rt_host_state: "/home/{{ hostvars['localhost'].e.jumpbox.user }}/rhoso/.state/router"
   tasks:
+    # env_model registers the jump box with ansible_become: true, a connection variable that beats the `become`
+    # keyword: tasks that must run as the user set the variable instead.
     - name: OVA from vyos-vsphere-image
       ansible.builtin.stat:
         path: "{{ rt.ova.dir }}/{{ rt.ova.file }}"
         checksum_algorithm: sha256
       register: rt_ova
-      become: false
+      vars:
+        ansible_become: false
 
     - name: The OVA matches its manifest
       ansible.builtin.assert:
@@ -47,19 +50,21 @@
         fail_msg: "{{ rt.ova.dir }}/{{ rt.ova.file }}: {{ 'missing' if not rt_ova.stat.exists else 'sha256 ' ~ rt_ova.stat.checksum }}"
         quiet: true
 
-    - name: rhoso/.state/router
+    - name: rhoso/.state/router (the toolbox runs as the jump box user)
       ansible.builtin.file:
         path: "{{ rt_host_state }}"
         state: directory
+        owner: "{{ hostvars['localhost'].e.jumpbox.user }}"
+        group: "{{ hostvars['localhost'].e.jumpbox.user }}"
         mode: "0700"
-      become: false
 
     - name: Hard link into rhoso/.state/router (same file system, no copy)
       ansible.builtin.file:
         src: "{{ rt.ova.dir }}/{{ rt.ova.file }}"
         dest: "{{ rt_host_state }}/{{ rt.ova.file }}"
         state: hard
-      become: false
+      vars:
+        ansible_become: false
 
 - name: Router VM (vSphere)
   hosts: localhost
