@@ -172,7 +172,7 @@
       detail: "{{ vr_bfv_vol_state.stdout | default('') | trim }}"
     - phase: storage
       name: boot-from-volume instance ACTIVE and reachable
-      ok: "{{ vr_bfv.rc | default(1) == 0 and (vr_bfv_show.stdout | default('{}') | from_json).status | default('?') == 'ACTIVE' and not (vr_bfv_ssh.failed | default(true)) }}"
+      ok: "{{ (vr_bfv_show.stdout | default('{}') | from_json).status | default('?') == 'ACTIVE' and vr_bfv_ssh is not skipped and not (vr_bfv_ssh.failed | default(true)) }}"
       detail: "{{ (vr_bfv_show.stdout | default('{}') | from_json).status | default('not created') }}{{ (' ' ~ (vr_bfv_fip.stdout | from_json).floating_ip_address) if vr_bfv_fip.stdout | default('') | length > 0 else '' }}{{ (': ' ~ (vr_bfv_show.stdout | from_json).fault.message | default('')) if (vr_bfv_show.stdout | default('{}') | from_json).fault | default(none) else '' }}"
   loop_control:
     loop_var: chk
