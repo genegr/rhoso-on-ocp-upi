@@ -1,0 +1,93 @@
+---
+# Router values from envs/<env>.yaml (router, networks.external, rhoso.verify.external.gateway, jumpbox LAN).
+- name: Router values
+  ansible.builtin.set_fact:
+    rt: "{{ e.router }}"
+    rt_dir: "{{ state_dir }}/router"
+    rt_ext_cidr: "{{ e.networks.external.cidr }}"
+    rt_ext_ip: "{{ e.rhoso.verify.external.gateway }}"
+    rt_prefix: "{{ e.jumpbox.prefix }}"
+    rt_gateway: "{{ e.jumpbox.gateway }}"
+    rt_dns: "{{ e.jumpbox.dns_servers }}"
+    rt_pub: "{{ lookup('ansible.builtin.file', ssh_key ~ '.pub') }}"
+
+- name: Router config is complete
+  ansible.builtin.assert:
+    that:
+      - rt.name | default('') is match('^[a-z0-9][-a-z0-9]*$')
+      - rt.datastore | default('') | length > 0
+      - rt.ova.dir is defined and rt.ova.file is defined and rt.ova.sha256 | default('') | length == 64
+      - rt.mgmt.portgroup is defined and rt.mgmt.ip is defined
+      - rt.external_portgroup | default('') | length > 0
+      - rt.allowed_sources | default([]) | length > 0
+      - rt_ext_cidr is match('^[0-9.]+/[0-9]+$')
+      - rt_ext_ip | length > 0
+    fail_msg: >-
+      router {name, datastore, ova {dir, file, sha256}, mgmt {portgroup, ip}, external_portgroup, allowed_sources},
+      networks.external.cidr and rhoso.verify.external.gateway are required (envs/env.example.yaml)
+    quiet: true
+
+# The whole desired router configuration, as VyOS prints it in `show configuration commands` (values quoted) so that
+# vyos_config compares line by line and a second run reports changed=0.
+- name: Desired configuration
+  ansible.builtin.set_fact:
+    rt_lines: >-
+      {%- set L = [] -%}
+      {%- set _ = L.append("set system host-name '" ~ rt.name ~ "'") -%}
+      {%- for d in rt_dns -%}{%- set _ = L.append("set system name-server '" ~ d ~ "'") -%}{%- endfor -%}
+      {%- for n in rt.ntp_servers | default([]) -%}{%- set _ = L.append("set service ntp server '" ~ n ~ "'") -%}{%- endfor -%}
+      {%- set _ = L.append("set service ssh disable-password-authentication") -%}
+      {%- set _ = L.append("set interfaces ethernet eth0 address '" ~ rt.mgmt.ip ~ "/" ~ rt_prefix ~ "'") -%}
+      {%- set _ = L.append("set interfaces ethernet eth0 description 'lab LAN (" ~ rt.mgmt.portgroup ~ ")'") -%}
+      {%- set _ = L.append("set interfaces ethernet eth1 address '" ~ rt_ext_ip ~ "/" ~ rt_ext_cidr.split('/')[1] ~ "'") -%}
+      {%- set _ = L.append("set interfaces ethernet eth1 description 'RHOSO external network (" ~ rt.external_portgroup ~ ")'") -%}
+      {%- set _ = L.append("set protocols static route 0.0.0.0/0 next-hop '" ~ rt_gateway ~ "'") -%}
+      {#- Source NAT: the VMs (floating IPs and router SNAT addresses) leave through eth0 as the router's address,
+          except toward the allowed lab networks, which see the floating IPs as they are. -#}
+      {%- for s in rt.allowed_sources -%}
+      {%-   set r = 100 + loop.index0 -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " description 'RHOSO VMs to " ~ s ~ ": no NAT'") -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " destination address '" ~ s ~ "'") -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " exclude") -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " outbound-interface name 'eth0'") -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " source address '" ~ rt_ext_cidr ~ "'") -%}
+      {%- endfor -%}
+      {%- set _ = L.append("set nat source rule 200 description 'RHOSO VMs to everything else: masquerade'") -%}
+      {%- set _ = L.append("set nat source rule 200 outbound-interface name 'eth0'") -%}
+      {%- set _ = L.append("set nat source rule 200 source address '" ~ rt_ext_cidr ~ "'") -%}
+      {%- set _ = L.append("set nat source rule 200 translation address 'masquerade'") -%}
+      {#- Forwarding: replies; the VMs out to anywhere; new connections to the VMs only from allowed_sources. -#}
+      {%- set f = "set firewall ipv4 forward filter " -%}
+      {%- set _ = L.append(f ~ "default-action 'drop'") -%}
+      {%- set _ = L.append(f ~ "rule 10 action 'accept'") -%}
+      {%- set _ = L.append(f ~ "rule 10 state 'established'") -%}
+      {%- set _ = L.append(f ~ "rule 10 state 'related'") -%}
+      {%- set _ = L.append(f ~ "rule 20 action 'accept'") -%}
+      {%- set _ = L.append(f ~ "rule 20 description 'RHOSO VMs out'") -%}
+      {%- set _ = L.append(f ~ "rule 20 inbound-interface name 'eth1'") -%}
+      {%- set _ = L.append(f ~ "rule 20 source address '" ~ rt_ext_cidr ~ "'") -%}
+      {%- for s in rt.allowed_sources -%}
+      {%-   set r = 30 + loop.index0 -%}
+      {%-   set _ = L.append(f ~ "rule " ~ r ~ " action 'accept'") -%}
+      {%-   set _ = L.append(f ~ "rule " ~ r ~ " description 'lab " ~ s ~ " to the RHOSO VMs'") -%}
+      {%-   set _ = L.append(f ~ "rule " ~ r ~ " destination address '" ~ rt_ext_cidr ~ "'") -%}
+      {%-   set _ = L.append(f ~ "rule " ~ r ~ " inbound-interface name 'eth0'") -%}
+      {%-   set _ = L.append(f ~ "rule " ~ r ~ " source address '" ~ s ~ "'") -%}
+      {%- endfor -%}
+      {#- The router itself: replies, ICMP, SSH from allowed_sources; nothing else. -#}
+      {%- set i = "set firewall ipv4 input filter " -%}
+      {%- set _ = L.append(i ~ "default-action 'drop'") -%}
+      {%- set _ = L.append(i ~ "rule 10 action 'accept'") -%}
+      {%- set _ = L.append(i ~ "rule 10 state 'established'") -%}
+      {%- set _ = L.append(i ~ "rule 10 state 'related'") -%}
+      {%- set _ = L.append(i ~ "rule 20 action 'accept'") -%}
+      {%- set _ = L.append(i ~ "rule 20 protocol 'icmp'") -%}
+      {%- for s in rt.allowed_sources -%}
+      {%-   set r = 30 + loop.index0 -%}
+      {%-   set _ = L.append(i ~ "rule " ~ r ~ " action 'accept'") -%}
+      {%-   set _ = L.append(i ~ "rule " ~ r ~ " description 'SSH from " ~ s ~ "'") -%}
+      {%-   set _ = L.append(i ~ "rule " ~ r ~ " destination port '22'") -%}
+      {%-   set _ = L.append(i ~ "rule " ~ r ~ " protocol 'tcp'") -%}
+      {%-   set _ = L.append(i ~ "rule " ~ r ~ " source address '" ~ s ~ "'") -%}
+      {%- endfor -%}
+      {{ L }}

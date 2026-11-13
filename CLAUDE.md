@@ -17,6 +17,8 @@ nodes. Ansible drives every step from that repo's pinned toolbox container on th
   `multipath -ll` and `iscsiadm -m session` on a compute in `verify.yml` (read-only; no module reports them);
   `raw` on the CirrOS test instances in `verify.yml` (no Python in the guest);
   `oc`/`openstack` CLIs only where no module exists (`openstack` through `k8s_exec` in pod `openstackclient`).
+  The VyOS router (`router.yml`) is configured only with `vyos.vyos` modules over `network_cli` (libssh); its
+  cloud-init seed applies once, at the VM's first boot.
   `plugins/modules/vmware_dvpg_security.py` exists because `community.vmware.vmware_dvs_portgroup` rebuilds the whole
   port group config (teaming, failure criteria, inherited flags) on every update: it sets only the security policy of
   an existing distributed port group.
@@ -45,7 +47,8 @@ jumpbox/                                cloud-init user-data template + runbook 
 envs/                                   <env>.yaml, vault.yml (gitignored), examples
 docs/                                   network-requirements.md (doc-sourced checklist), design.md
 playbooks/, roles/                      discover, netcheck, edpm_*, then the RHOSO phases (rhoso.yml: tags
-                                        operators, networks, flasharray, controlplane, dataplane), verify.yml
+                                        operators, networks, flasharray, controlplane, dataplane), verify.yml,
+                                        router.yml (VyOS, OVA from ../vyos-vsphere-image), rhoso_teardown.yml
 plugins/modules/                        vmware_dvpg_security
 .claude/skills/                         rhoso-* skills: jumpbox, discover, netcheck, edpm-prep, deploy, dataplane,
                                         verify, status

@@ -97,6 +97,18 @@ openstack token issue
 openstack catalog list
 ```
 
+## 6. Reaching the instances (floating IPs)
+Floating IPs live on the external network (`networks.external`), behind the VyOS router (`playbooks/router.yml`).
+The router lets only `router.allowed_sources` (the lab LAN) open connections to the instances, and hides the
+instances behind its own address for everything else (internet access). Your machine needs **its own static route**
+for the external network via the router's lab address (`router.mgmt.ip`); nobody adds it for you, except on the jump
+box:
+- Linux: `ip route add <external cidr> via <router.mgmt.ip>`, made permanent in netplan (`routes:`) or NetworkManager
+  (`nmcli connection modify <conn> +ipv4.routes "<external cidr> <router.mgmt.ip>"`).
+- Windows (elevated): `route -p add <external network> mask <netmask> <router.mgmt.ip>`.
+
+Then `ssh <user>@<floating IP>` works directly (security groups permitting). The instances see your real address.
+
 ## Troubleshooting
 | Symptom | Cause |
 |---|---|

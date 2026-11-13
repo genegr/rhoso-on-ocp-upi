@@ -1,0 +1,29 @@
+---
+# Runs on the router (network_cli, vyos.vyos): the whole desired configuration, saved; then read-only checks.
+- name: Router configuration
+  vyos.vyos.vyos_config:
+    lines: "{{ hostvars['localhost'].rt_lines }}"
+    match: line
+    save: true
+  register: rt_cfg
+
+- name: Checks (read-only)
+  vyos.vyos.vyos_command:
+    commands:
+      - show interfaces
+      - show ip route
+      - ping {{ hostvars['localhost'].rt_gateway }} count 2
+      - ping 1.1.1.1 count 2
+      - show nat source rules
+      - show version
+  register: rt_show
+  failed_when: false
+
+- name: Summary
+  ansible.builtin.debug:
+    msg:
+      - "config: {{ 'changed' if rt_cfg is changed else 'unchanged' }}"
+      - "{{ rt_show.stdout_lines[0] | default([]) }}"
+      - "gateway: {{ (rt_show.stdout[2] | default('')) | regex_search('\\d+% packet loss') }}"
+      - "internet: {{ (rt_show.stdout[3] | default('')) | regex_search('\\d+% packet loss') }}"
+      - "{{ (rt_show.stdout_lines[5] | default([])) | select('match', '^(Version|Build commit|Built on)') | list }}"

@@ -1,0 +1,134 @@
+---
+# VyOS router between the lab LAN and the OpenStack external network (networks.external), from the OVA that the
+# vyos-vsphere-image repo builds on the jump box:
+#   eth0 = router.mgmt on the lab LAN (default route = the LAN gateway), eth1 = rhoso.verify.external.gateway;
+#   the VMs are source-NATed (masquerade) except toward router.allowed_sources, which see their floating IPs as they
+#   are; only allowed_sources may open connections to the VMs; SSH to the router only from allowed_sources.
+# Every machine in allowed_sources reaches the VMs with its own static route networks.external via router.mgmt.ip;
+# this playbook adds it on the jump box only (systemd-networkd drop-in on its netplan unit).
+# The VM is created once (cloud-init seed for the first boot); afterwards vyos_config owns the configuration and a
+# second run reports changed=0. Changes vSphere and the jump box: --check --diff first, then the user's go-ahead.
+#   ansible-playbook playbooks/router.yml -e env=<name> [--check --diff]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - env_model
+  tasks:
+    - name: Router model
+      ansible.builtin.include_role:
+        name: router
+        tasks_from: model
+
+    - name: State directory
+      ansible.builtin.file:
+        path: "{{ rt_dir }}"
+        state: directory
+        mode: "0700"
+      check_mode: false
+
+- name: Jump box - the OVA (checksummed) where the toolbox sees it
+  hosts: jumpbox
+  gather_facts: false
+  vars:
+    rt: "{{ hostvars['localhost'].rt }}"
+    rt_host_state: "/home/{{ hostvars['localhost'].e.jumpbox.user }}/rhoso/.state/router"
+  tasks:
+    - name: OVA from vyos-vsphere-image
+      ansible.builtin.stat:
+        path: "{{ rt.ova.dir }}/{{ rt.ova.file }}"
+        checksum_algorithm: sha256
+      register: rt_ova
+      become: false
+
+    - name: The OVA matches its manifest
+      ansible.builtin.assert:
+        that: rt_ova.stat.exists and rt_ova.stat.checksum == rt.ova.sha256
+        fail_msg: "{{ rt.ova.dir }}/{{ rt.ova.file }}: {{ 'missing' if not rt_ova.stat.exists else 'sha256 ' ~ rt_ova.stat.checksum }}"
+        quiet: true
+
+    - name: rhoso/.state/router
+      ansible.builtin.file:
+        path: "{{ rt_host_state }}"
+        state: directory
+        mode: "0700"
+      become: false
+
+    - name: Hard link into rhoso/.state/router (same file system, no copy)
+      ansible.builtin.file:
+        src: "{{ rt.ova.dir }}/{{ rt.ova.file }}"
+        dest: "{{ rt_host_state }}/{{ rt.ova.file }}"
+        state: hard
+      become: false
+
+- name: Router VM (vSphere)
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/community.vmware.vmware:
+      hostname: "{{ e.vsphere.server }}"
+      username: "{{ vault_vsphere_user }}"
+      password: "{{ vault_vsphere_password }}"
+      validate_certs: false
+  tasks:
+    - name: VM
+      ansible.builtin.include_role:
+        name: router
+        tasks_from: vm
+
+    - name: The router as a network device (SSH key of the toolbox, user vyos)
+      ansible.builtin.add_host:
+        name: router
+        ansible_host: "{{ rt.mgmt.ip }}"
+        ansible_connection: ansible.netcommon.network_cli
+        ansible_network_os: vyos.vyos.vyos
+        ansible_network_cli_ssh_type: libssh
+        ansible_user: vyos
+        ansible_ssh_private_key_file: "{{ ssh_key }}"
+      changed_when: false
+
+- name: Router configuration
+  hosts: router
+  gather_facts: false
+  tasks:
+    - name: Configuration and checks
+      ansible.builtin.include_role:
+        name: router
+        tasks_from: config
+      when: not ansible_check_mode or hostvars['localhost'].rt_vm.instance is defined
+
+- name: Jump box - static route to the external network via the router
+  hosts: jumpbox
+  gather_facts: false
+  vars:
+    rt: "{{ hostvars['localhost'].rt }}"
+  tasks:
+    - name: Drop-in directory of the netplan unit "mgmt" (jumpbox/user-data.yaml.j2)
+      ansible.builtin.file:
+        path: /etc/systemd/network/10-netplan-mgmt.network.d
+        state: directory
+        mode: "0755"
+
+    - name: Route {{ hostvars['localhost'].rt_ext_cidr }} via {{ rt.mgmt.ip }} (drop-in on the netplan unit "mgmt")
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/10-netplan-mgmt.network.d/90-rhoso-external.conf
+        mode: "0644"
+        content: |
+          # Managed by rhoso-on-ocp-upi router.yml: the OpenStack external network is behind the VyOS router
+          [Route]
+          Destination={{ hostvars['localhost'].rt_ext_cidr }}
+          Gateway={{ rt.mgmt.ip }}
+      register: rt_route
+
+    - name: Apply
+      ansible.builtin.systemd_service:
+        name: systemd-networkd
+        state: restarted
+      when: rt_route is changed
+
+    - name: The router answers on the external side through the route
+      ansible.builtin.command: ping -c 2 -W 2 {{ hostvars['localhost'].rt_ext_ip }}
+      register: rt_ping
+      changed_when: false
+      failed_when: rt_ping.rc != 0
+      when: not ansible_check_mode

@@ -1,0 +1,116 @@
+---
+# The router VM, created once: OVA (checksummed, hard-linked into .state by the jump box play) -> two NICs in OVF
+# order (management = eth0, trunk = eth1) -> a SATA CD-ROM with the cidata seed (first boot only) -> power on.
+# An existing VM is left alone: its configuration is vyos_config's job (config.yml).
+- name: Router VM (current)
+  community.vmware.vmware_guest_info:
+    datacenter: "{{ e.vsphere.datacenter }}"
+    name: "{{ rt.name }}"
+  register: rt_vm
+  failed_when: false
+
+- name: Would create (check mode)
+  ansible.builtin.debug:
+    msg: >-
+      {{ rt.name }} from {{ rt.ova.file }} on {{ e.vsphere.esxi_host }} / {{ rt.datastore }}: eth0 {{ rt.mgmt.portgroup }}
+      {{ rt.mgmt.ip }}/{{ rt_prefix }} gw {{ rt_gateway }}, eth1 {{ rt.external_portgroup }} {{ rt_ext_ip }}, cidata seed
+      on a SATA CD-ROM, then power on
+  when: rt_vm.instance is not defined and ansible_check_mode
+
+- name: Create the router VM
+  when: rt_vm.instance is not defined and not ansible_check_mode
+  block:
+    - name: Seed directory
+      ansible.builtin.file:
+        path: "{{ rt_dir }}/seed"
+        state: directory
+        mode: "0700"
+
+    - name: Console password for user vyos (generated once; SSH is key-only)
+      ansible.builtin.set_fact:
+        rt_console_pw: "{{ lookup('ansible.builtin.password', rt_dir ~ '/vyos-console-password', length=24,
+                           chars=['ascii_letters', 'digits']) }}"
+      no_log: true
+
+    - name: cloud-init seed (NoCloud), first boot only
+      ansible.builtin.copy:
+        dest: "{{ rt_dir }}/seed/{{ item.name }}"
+        mode: "0600"
+        content: "{{ item.content }}"
+      loop:
+        - name: meta-data
+          content: |
+            instance-id: {{ rt.name }}-1
+            local-hostname: {{ rt.name }}
+        - name: user-data
+          content: |
+            #cloud-config
+            vyos_config_commands:
+              - set system host-name '{{ rt.name }}'
+              - set interfaces ethernet eth0 address '{{ rt.mgmt.ip }}/{{ rt_prefix }}'
+              - set protocols static route 0.0.0.0/0 next-hop '{{ rt_gateway }}'
+              - set system login user vyos authentication public-keys rhoso-toolbox type '{{ rt_pub.split()[0] }}'
+              - set system login user vyos authentication public-keys rhoso-toolbox key '{{ rt_pub.split()[1] }}'
+              - set system login user vyos authentication plaintext-password '{{ rt_console_pw }}'
+              - set service ssh disable-password-authentication
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+
+    - name: Seed ISO (volume label cidata)
+      community.general.iso_create:
+        src_files:
+          - "{{ rt_dir }}/seed/meta-data"
+          - "{{ rt_dir }}/seed/user-data"
+        dest_iso: "{{ rt_dir }}/seed.iso"
+        vol_ident: cidata
+        interchange_level: 3
+        joliet: 3
+        rock_ridge: "1.09"
+
+    - name: Deploy the OVA (powered off)
+      community.vmware.vmware_deploy_ovf:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        esxi_hostname: "{{ e.vsphere.esxi_host }}"
+        datastore: "{{ rt.datastore }}"
+        name: "{{ rt.name }}"
+        ovf: "{{ repo_root }}/.state/router/{{ rt.ova.file }}"
+        networks:
+          management: "{{ rt.mgmt.portgroup }}"
+          trunk: "{{ rt.external_portgroup }}"
+        disk_provisioning: thin
+        power_on: false
+        wait_for_ip_address: false
+
+    - name: Upload the seed ISO next to the VM
+      community.vmware.vsphere_copy:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        datastore: "{{ rt.datastore }}"
+        src: "{{ rt_dir }}/seed.iso"
+        path: "{{ rt.name }}/{{ rt.name }}-seed.iso"
+
+    - name: CD-ROM with the seed
+      community.vmware.vmware_guest:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ rt.name }}"
+        cdrom:
+          - controller_type: sata
+            controller_number: 0
+            unit_number: 0
+            type: iso
+            iso_path: "[{{ rt.datastore }}] {{ rt.name }}/{{ rt.name }}-seed.iso"
+            state: present
+
+    - name: Power on
+      community.vmware.vmware_guest_powerstate:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ rt.name }}"
+        state: powered-on
+
+- name: SSH on {{ rt.mgmt.ip }} (first boot applies the seed, a few minutes)
+  ansible.builtin.wait_for:
+    host: "{{ rt.mgmt.ip }}"
+    port: 22
+    timeout: 900
+    search_regex: SSH
+  when: not ansible_check_mode
