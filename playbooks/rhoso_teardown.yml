@@ -1,0 +1,100 @@
+---
+# Remove the RHOSO control plane and its persistent volumes (irreversible: every OpenStack database, message queue
+# and OVN database is lost). Kept: the operators, the networks (NNCP, NAD, MetalLB, NetConfig), osp-secret and the
+# other secrets, OpenStackVersion, the data-plane node set and its finished deployments, the bare-metal hosts.
+# Afterwards: rhoso.yml --tags controlplane, then --tags dataplane -e dataplane_run=<new suffix> (fresh databases:
+# the computes are deployed again and re-registered).
+# Typed confirmation (or -e confirm=<env>); --check prints the plan and deletes nothing.
+#   ansible-playbook playbooks/rhoso_teardown.yml -e env=<name> [-e confirm=<name>] [--check]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - env_model
+
+- name: Control plane teardown
+  hosts: localhost
+  gather_facts: false
+  vars:
+    rhoso_namespace: openstack
+    rhoso_controlplane_name: controlplane
+  environment:
+    K8S_AUTH_KUBECONFIG: "/ocp/.state/clusters/{{ e.ocp_cluster }}/install/auth/kubeconfig"
+  tasks:
+    - name: What exists
+      kubernetes.core.k8s_info:
+        api_version: "{{ item.api }}"
+        kind: "{{ item.kind }}"
+        namespace: "{{ rhoso_namespace }}"
+      loop:
+        - {api: core.openstack.org/v1beta1, kind: OpenStackControlPlane}
+        - {api: v1, kind: PersistentVolumeClaim}
+      loop_control:
+        label: "{{ item.kind }}"
+      register: td_now
+
+    - name: Plan
+      ansible.builtin.debug:
+        msg:
+          - "OpenStackControlPlane: {{ td_now.results[0].resources | map(attribute='metadata.name') | list }}"
+          - "PVCs in {{ rhoso_namespace }} ({{ td_now.results[1].resources | length }}):
+             {{ td_now.results[1].resources | map(attribute='metadata.name') | list }}"
+
+    - name: Type the environment name to delete the OpenStack control plane and all its volumes
+      ansible.builtin.pause:
+        prompt: "Type '{{ env }}' to delete the control plane of {{ e.ocp_cluster }} and its {{ td_now.results[1].resources | length }} PVCs"
+      register: td_typed
+      when: confirm is not defined and not ansible_check_mode
+
+    - name: The name matches
+      ansible.builtin.assert:
+        that: (confirm | default(td_typed.user_input | default(''))) == env
+        fail_msg: aborted
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Delete the OpenStackControlPlane (the operators remove the services)
+      kubernetes.core.k8s:
+        api_version: core.openstack.org/v1beta1
+        kind: OpenStackControlPlane
+        namespace: "{{ rhoso_namespace }}"
+        name: "{{ rhoso_controlplane_name }}"
+        state: absent
+        wait: true
+        wait_timeout: 1200
+
+    - name: StatefulSets gone (nothing mounts the volumes any more)
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: StatefulSet
+        namespace: "{{ rhoso_namespace }}"
+      register: td_sts
+      until: td_sts.resources | length == 0
+      retries: 60
+      delay: 10
+      when: not ansible_check_mode
+
+    - name: Delete the PVCs
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ rhoso_namespace }}"
+        name: "{{ item.metadata.name }}"
+        state: absent
+        wait: true
+        wait_timeout: 300
+      loop: "{{ td_now.results[1].resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Their volumes released (PVs gone)
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolume
+      register: td_pvs
+      until: >-
+        td_pvs.resources | selectattr('spec.claimRef.namespace', 'defined')
+        | selectattr('spec.claimRef.namespace', 'equalto', rhoso_namespace) | list | length == 0
+      retries: 60
+      delay: 10
+      when: not ansible_check_mode
