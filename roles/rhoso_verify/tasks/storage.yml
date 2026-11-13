@@ -51,26 +51,31 @@
   changed_when: false
   failed_when: false
 
+# The bus (virtio-blk vdX or virtio-scsi sdX) depends on the image/flavor: take the second disk, whatever its name.
 - name: The disk inside the guest
-  ansible.builtin.raw: test -b /dev/vdb && echo present
+  ansible.builtin.raw: ls /sys/block | grep -E '^(vd|sd)[a-z]$' | sort | sed -n 2p
   delegate_to: "{{ vr_vms[0].name }}"
   register: vr_vdb
-  until: "'present' in vr_vdb.stdout | default('')"
+  until: vr_vdb.stdout | default('') | trim | length > 0
   retries: 12
   delay: 5
   changed_when: false
   failed_when: false
 
+- name: Guest disk
+  ansible.builtin.set_fact:
+    vr_gdisk: "{{ vr_vdb.stdout | default('') | trim }}"
+
 - name: Write a marker and read it back (raw device, then dropped caches)
   ansible.builtin.raw: >-
-    echo {{ verify_marker }} | sudo dd of=/dev/vdb bs=512 count=1 conv=sync,fsync 2>/dev/null &&
+    echo {{ verify_marker }} | sudo dd of=/dev/{{ vr_gdisk }} bs=512 count=1 conv=sync,fsync 2>/dev/null &&
     sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' &&
-    sudo dd if=/dev/vdb bs=512 count=1 2>/dev/null | head -c {{ verify_marker | length }}
+    sudo dd if=/dev/{{ vr_gdisk }} bs=512 count=1 2>/dev/null | head -c {{ verify_marker | length }}
   delegate_to: "{{ vr_vms[0].name }}"
   register: vr_marker
   changed_when: false
   failed_when: false
-  when: "'present' in vr_vdb.stdout | default('')"
+  when: vr_gdisk | length > 0
 
 # Volume from the image: cinder-volume (on an OCP node) writes the image into a new Pure volume, i.e. an attach on a
 # master, the path the realm hosts broke. Named, so cleanup finds it.
@@ -118,7 +123,8 @@
   register: vr_bfv_fip
   changed_when: true
   failed_when: vr_bfv_fip.rc | default(0) != 0
-  when: vr_bfv.rc | default(1) == 0
+  when: >-
+    vr_bfv_show.stdout | default('') is search('"status": "ACTIVE"')
 
 - name: Attach it
   kubernetes.core.k8s_exec:
@@ -127,7 +133,7 @@
   register: vr_bfv_add
   changed_when: true
   failed_when: vr_bfv_add.rc | default(0) != 0
-  when: vr_bfv.rc | default(1) == 0
+  when: vr_bfv_fip is not skipped and vr_bfv_fip.rc | default(1) == 0
 
 - name: SSH on the boot-from-volume instance
   ansible.builtin.wait_for:
@@ -137,7 +143,7 @@
     search_regex: SSH
   register: vr_bfv_ssh
   ignore_errors: true
-  when: vr_bfv.rc | default(1) == 0
+  when: vr_bfv_add is not skipped and vr_bfv_add.rc | default(1) == 0
 
 - name: Checks
   ansible.builtin.include_tasks: check.yml
@@ -159,7 +165,7 @@
     - phase: storage
       name: guest writes and reads the volume
       ok: "{{ (vr_marker.stdout | default('') | trim) == verify_marker }}"
-      detail: "{{ 'no /dev/vdb in the guest' if 'present' not in vr_vdb.stdout | default('') else (vr_marker.stdout | default('') | trim) }}"
+      detail: "{{ 'no second disk in the guest' if vr_gdisk | default('') | length == 0 else ('/dev/' ~ vr_gdisk ~ ': ') ~ (vr_marker.stdout | default('') | trim) }}"
     - phase: storage
       name: volume from the image (cinder-volume attaches on an OCP node)
       ok: "{{ vr_bfv_vol_state.stdout | default('') | trim == 'available' }}"
@@ -167,7 +173,7 @@
     - phase: storage
       name: boot-from-volume instance ACTIVE and reachable
       ok: "{{ vr_bfv.rc | default(1) == 0 and (vr_bfv_show.stdout | default('{}') | from_json).status | default('?') == 'ACTIVE' and not (vr_bfv_ssh.failed | default(true)) }}"
-      detail: "{{ ((vr_bfv_show.stdout | default('{}') | from_json).status | default('?') ~ ' ' ~ (vr_bfv_fip.stdout | from_json).floating_ip_address) if vr_bfv.rc | default(1) == 0 else (vr_bfv.stderr | default('') | trim | truncate(200)) }}"
+      detail: "{{ (vr_bfv_show.stdout | default('{}') | from_json).status | default('not created') }}{{ (' ' ~ (vr_bfv_fip.stdout | from_json).floating_ip_address) if vr_bfv_fip.stdout | default('') | length > 0 else '' }}{{ (': ' ~ (vr_bfv_show.stdout | from_json).fault.message | default('')) if (vr_bfv_show.stdout | default('{}') | from_json).fault | default(none) else '' }}"
   loop_control:
     loop_var: chk
     label: "{{ chk.name }}"

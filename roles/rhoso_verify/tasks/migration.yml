@@ -31,7 +31,7 @@
   ignore_errors: true
 
 - name: The volume's marker is still there
-  ansible.builtin.raw: sudo dd if=/dev/vdb bs=512 count=1 2>/dev/null | head -c {{ verify_marker | length }}
+  ansible.builtin.raw: sudo dd if=/dev/{{ vr_gdisk | default('vdb') }} bs=512 count=1 2>/dev/null | head -c {{ verify_marker | length }}
   delegate_to: "{{ vr_vms[0].name }}"
   register: vr_mig_marker
   changed_when: false

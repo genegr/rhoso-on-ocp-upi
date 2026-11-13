@@ -48,7 +48,7 @@
 - name: Jump box test leg - vNIC on the external port group (vSphere)
   hosts: localhost
   gather_facts: false
-  tags: [base, smoke, gateway, storage, migration]
+  tags: [base, smoke]                 # what needs the leg (gateway, storage, migration need smoke)
   module_defaults:
     group/community.vmware.vmware:
       hostname: "{{ e.vsphere.server }}"
@@ -86,7 +86,7 @@
 - name: Jump box test leg - address (systemd-networkd)
   hosts: jumpbox
   gather_facts: false
-  tags: [base, smoke, gateway, storage, migration]
+  tags: [base, smoke]
   vars:
     vr_l: "{{ hostvars['localhost'] }}"
   tasks:
@@ -173,8 +173,8 @@
       when: ansible_check_mode
       tags: [always]
 
+    # No tags on the block: they would be inherited by every phase, and --skip-tags migration skipped them all.
     - name: Phases
-      tags: [base, smoke, gateway, storage, migration]
       block:
         - name: Floating-IP pool unused (checked from the test leg)
           ansible.builtin.assert:
@@ -185,6 +185,7 @@
               | selectattr('rc', 'equalto', 0) | map(attribute='item') | join(', ') }}
             quiet: true
           when: not vr_ext_exists
+          tags: [base]
 
         - name: base
           ansible.builtin.include_role:
@@ -227,6 +228,8 @@
           ansible.builtin.include_role:
             name: rhoso_verify
             tasks_from: check
+            apply: {tags: [always]}
+          tags: [always]
           vars:
             chk:
               phase: aborted

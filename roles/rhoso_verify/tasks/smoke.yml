@@ -81,7 +81,28 @@
   changed_when: false
   failed_when: vr_net.rc | default(0) != 0
 
-# --wait prints progress before the JSON: the result is read back with `server show` below, never parsed here.
+# Port binding per compute first: Neutron (OVN) must find each compute's chassis. Right after a data-plane redeploy
+# it refused for a while ("Refusing to bind port ... due to no OVN chassis for host"), so every instance went ERROR.
+- name: Port binding on each compute (temporary port, deleted right away)
+  kubernetes.core.k8s_exec:
+    command: >-
+      openstack port create {{ verify_prefix }}-bind-{{ item.split('.')[0] }} --network {{ vr_net_id }} --host {{ item }}
+      --tag {{ verify_tag }} -f json
+  loop: "{{ vr_hosts }}"
+  register: vr_bind
+  changed_when: true
+  failed_when: false
+
+- name: Remove the binding-test ports
+  kubernetes.core.k8s_exec:
+    command: "openstack port delete {{ (item.stdout | from_json).id }}"
+  loop: "{{ vr_bind.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  changed_when: true
+  failed_when: false
+
+# --wait prints progress before the JSON: the result is read back with `server show`, never parsed here.
 - name: One instance per compute (pinned with --availability-zone nova:<host>)
   kubernetes.core.k8s_exec:
     command: >-
@@ -93,12 +114,24 @@
   changed_when: true
   failed_when: false
 
+- name: Instance status after the build
+  kubernetes.core.k8s_exec:
+    command: "openstack server show {{ verify_prefix }}-{{ item.split('.')[0] }} -f json"
+  loop: "{{ vr_hosts }}"
+  register: vr_built
+  changed_when: false
+  failed_when: false
+
+- name: ACTIVE instances (only these get a floating IP; the others are recorded as FAIL with their fault)
+  ansible.builtin.set_fact:
+    vr_active_hosts: >-
+      {{ vr_built.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0)
+         | selectattr('stdout', 'search', '"status": "ACTIVE"') | map(attribute='item') | list }}
+
 - name: Floating IPs (tagged {{ verify_tag }})
   kubernetes.core.k8s_exec:
     command: "openstack floating ip create {{ verify_external_network }} --tag {{ verify_tag }} -f json"
-  loop: "{{ vr_servers.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list }}"
-  loop_control:
-    label: "{{ item.item }}"
+  loop: "{{ vr_active_hosts }}"
   register: vr_fips
   changed_when: true
   failed_when: vr_fips.rc | default(0) != 0
@@ -106,10 +139,10 @@
 - name: Attach them
   kubernetes.core.k8s_exec:
     command: >-
-      {{ vos }} server add floating ip {{ verify_prefix }}-{{ item.0.item.split('.')[0] }} {{ (item.1.stdout | from_json).floating_ip_address }}
-  loop: "{{ vr_servers.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list | zip(vr_fips.results) | list }}"
+      {{ vos }} server add floating ip {{ verify_prefix }}-{{ item.0.split('.')[0] }} {{ (item.1.stdout | from_json).floating_ip_address }}
+  loop: "{{ vr_active_hosts | zip(vr_fips.results) | list }}"
   loop_control:
-    label: "{{ item.0.item }} {{ (item.1.stdout | from_json).floating_ip_address }}"
+    label: "{{ item.0 }} {{ (item.1.stdout | from_json).floating_ip_address }}"
   register: vr_fip_add
   changed_when: true
   failed_when: vr_fip_add.rc | default(0) != 0
@@ -180,18 +213,26 @@
   register: vr_ew
   changed_when: false
   failed_when: false
-  when: vr_vms | length > 1 and vr_vms[0].fip
+  when: vr_vms | length > 1 and vr_vms[0].fip | length > 0
 
 - name: Checks
   ansible.builtin.include_tasks: check.yml
   loop: >-
     {%- set out = [{'phase': 'smoke', 'name': 'computes enabled and up', 'ok': vr_hosts | length == e.edpm_hosts | length,
                     'detail': (vr_hosts | length) ~ ' of ' ~ (e.edpm_hosts | length) ~ ' edpm_hosts'}] -%}
-    {%- for r in vr_servers.results -%}
+    {%- for r in vr_bind.results -%}
+    {%-   set p = (r.stdout | default('{}') | from_json) if r.rc | default(1) == 0 else {} -%}
+    {%-   set _ = out.append({'phase': 'smoke', 'name': 'port binding on ' ~ r.item.split('.')[0],
+            'ok': p.binding_vif_type | default('') not in ['', 'binding_failed', 'unbound'],
+            'detail': p.binding_vif_type | default(r.stderr | default('') | trim | truncate(150))}) -%}
+    {%- endfor -%}
+    {%- for r in vr_built.results -%}
+    {%-   set b = (r.stdout | default('{}') | from_json) if r.rc | default(1) == 0 else {} -%}
     {%-   set v = vr_vms | selectattr('want', 'equalto', r.item) | first | default({}) -%}
     {%-   set _ = out.append({'phase': 'smoke', 'name': 'instance on ' ~ r.item.split('.')[0],
-            'ok': v.status | default('') == 'ACTIVE' and v.host | default('') == r.item,
-            'detail': (v.status | default('') ~ ' on ' ~ v.host | default('')) if v else (r.stderr | default(r.msg | default('')) | trim | truncate(200))}) -%}
+            'ok': b.status | default('') == 'ACTIVE' and b['OS-EXT-SRV-ATTR:host'] | default('') == r.item,
+            'detail': (b.status | default('?') ~ ' on ' ~ b['OS-EXT-SRV-ATTR:host'] | default('-'))
+                      ~ ((': ' ~ (b.fault.message | default(''))) if b.fault is defined and b.fault else '')}) -%}
     {%- endfor -%}
     {%- for r in vr_ssh_port.results | default([]) -%}
     {%-   set _ = out.append({'phase': 'smoke', 'name': 'north-south: SSH to ' ~ r.item.name ~ ' floating IP',

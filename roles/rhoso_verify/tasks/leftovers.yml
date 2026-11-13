@@ -8,6 +8,7 @@
     - {kind: servers, cmd: "openstack server list --name ^{{ verify_prefix }}- -f json"}
     - {kind: volumes, cmd: "openstack volume list -f json"}
     - {kind: fips, cmd: "openstack floating ip list --tags {{ verify_tag }} -f json"}
+    - {kind: ports, cmd: "openstack port list --tags {{ verify_tag }} -f json"}
     - {kind: routers, cmd: "openstack router list -f json"}
     - {kind: networks, cmd: "openstack network list -f json"}
     - {kind: security_groups, cmd: "openstack security group list -f json"}

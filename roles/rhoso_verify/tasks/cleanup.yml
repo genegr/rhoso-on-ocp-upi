@@ -20,6 +20,14 @@
   changed_when: true
   failed_when: vr_c_fip.rc | default(0) != 0
 
+- name: Delete the binding-test ports
+  kubernetes.core.k8s_exec:
+    command: "openstack port delete {{ vr_lo.ports | map(attribute='ID') | join(' ') }}"
+  when: vr_lo.ports | default([]) | length > 0
+  register: vr_c_port
+  changed_when: true
+  failed_when: vr_c_port.rc | default(0) != 0
+
 # Detached once their servers are gone.
 - name: Volumes detached
   kubernetes.core.k8s_exec:
