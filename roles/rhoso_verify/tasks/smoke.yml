@@ -215,6 +215,25 @@
   failed_when: false
   when: vr_vms | length > 1 and vr_vms[0].fip | length > 0
 
+# The subnet has no dns_nameservers: OVN DHCP hands out Neutron's [ovn] dns_servers (the lab DNS); the router
+# masquerades the queries. A lab name and an internet name must both resolve.
+- name: DNS inside the first instance
+  ansible.builtin.raw: nslookup {{ item }}
+  delegate_to: "{{ vr_vms[0].name }}"
+  loop: "{{ ['api.' ~ e.domain, 'registry.redhat.io'] }}"     # a lab name (the cluster's AD zone) and an internet name
+  register: vr_dns
+  changed_when: false
+  failed_when: false
+  when: vr_vms | length > 0 and vr_vms[0].fip | length > 0
+
+- name: Internet from the first instance (through the router's source NAT)
+  ansible.builtin.raw: ping -c 3 -W 2 1.1.1.1
+  delegate_to: "{{ vr_vms[0].name }}"
+  register: vr_inet
+  changed_when: false
+  failed_when: false
+  when: vr_vms | length > 0 and vr_vms[0].fip | length > 0
+
 - name: Checks
   ansible.builtin.include_tasks: check.yml
   loop: >-
@@ -249,8 +268,24 @@
     {%-   set _ = out.append({'phase': 'smoke', 'name': 'east-west: ' ~ vr_vms[0].name ~ ' -> ' ~ r.item.name,
             'ok': r.rc | default(1) == 0, 'detail': (r.stdout | default('') | regex_search('\\d+% packet loss') | default('', true))}) -%}
     {%- endfor -%}
-    {%- set _ = out.append({'phase': 'smoke', 'name': 'tenant network MTU', 'ok': none,
-          'detail': 'geneve network MTU ' ~ (vr_net.stdout | from_json).mtu ~ ' (Neutron global_physnet_mtu decides it; the tenant VLAN runs 9000)'}) -%}
+    {%- set want_mtu = e.rhoso.controlplane.tenant_mtu | default(none) -%}
+    {%- set _ = out.append({'phase': 'smoke', 'name': 'tenant network MTU',
+          'ok': none if want_mtu is none else ((vr_net.stdout | from_json).mtu | int == want_mtu | int),
+          'detail': 'geneve network MTU ' ~ (vr_net.stdout | from_json).mtu ~ (('' if want_mtu is none else ', wanted ' ~ want_mtu)
+                    ~ ' (Neutron [ml2] path_mtu)')}) -%}
+    {%- for r in vr_dns.results | default([]) if r.skipped is not defined -%}
+    {%-   set _ = out.append({'phase': 'smoke', 'name': 'DNS in the instance: ' ~ r.item,
+            'ok': r.rc | default(1) == 0 and (r.stdout | default('')) is search('Name:|canonical name')
+                  and (r.stdout | default('')) is not search("can't find|can't resolve|NXDOMAIN|timed out"),
+            'detail': ('resolved through ' ~ (r.stdout | default('') | regex_search('Server:\s*(\S+)', '\\1') | first | default('?')))
+                      if (r.stdout | default('')) is search('Name:|canonical name')
+                      else (r.stdout | default('no answer') | regex_search("(can't find|can't resolve|timed out)[^\n]*") | default('no answer', true))}) -%}
+    {%- endfor -%}
+    {%- if vr_inet is defined and vr_inet.skipped is not defined -%}
+    {%-   set _ = out.append({'phase': 'smoke', 'name': 'internet from the instance (router source NAT)',
+            'ok': vr_inet.rc | default(1) == 0,
+            'detail': vr_inet.stdout | default('') | regex_search('[0-9]+% packet loss') | default('no reply', true)}) -%}
+    {%- endif -%}
     {{ out }}
   loop_control:
     loop_var: chk

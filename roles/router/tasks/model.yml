@@ -50,7 +50,17 @@
       {%- set _ = L.append("set interfaces ethernet eth1 description 'RHOSO external network (" ~ rt.external_portgroup ~ ")'") -%}
       {%- set _ = L.append("set protocols static route 0.0.0.0/0 next-hop " ~ rt_gateway) -%}
       {#- Source NAT: the VMs (floating IPs and router SNAT addresses) leave through eth0 as the router's address,
-          except toward the allowed lab networks, which see the floating IPs as they are. -#}
+          except toward the allowed lab networks, which see the floating IPs as they are. Lab servers the VMs need but
+          that have no route back to the external network (the instance DNS servers: the AD DC) are masqueraded
+          anyway (rules 90+, evaluated before the no-NAT rules). -#}
+      {%- for d in rt.masquerade_to | default(e.rhoso.controlplane.instance_dns_servers | default([])) -%}
+      {%-   set r = 90 + loop.index0 -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " description 'RHOSO VMs to " ~ d ~ " (no route back): masquerade'") -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " destination address '" ~ d ~ "'") -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " outbound-interface name 'eth0'") -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " source address '" ~ rt_ext_cidr ~ "'") -%}
+      {%-   set _ = L.append("set nat source rule " ~ r ~ " translation address 'masquerade'") -%}
+      {%- endfor -%}
       {%- for s in rt.allowed_sources -%}
       {%-   set r = 100 + loop.index0 -%}
       {%-   set _ = L.append("set nat source rule " ~ r ~ " description 'RHOSO VMs to " ~ s ~ ": no NAT'") -%}

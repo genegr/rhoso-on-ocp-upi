@@ -1,0 +1,173 @@
+---
+# The tenant user's view (loop_var t, CLI as the tenant's first user): login, admin calls refused, an instance on the
+# tenant network with a floating IP reached from the jump box through the VyOS router (routed, no test leg), DNS and
+# internet inside it, a volume attached. Everything it creates is named tcheck-* and removed at the end.
+- name: "{{ t.name }}: CLI as the tenant user"
+  ansible.builtin.include_tasks: as_user.yml
+  vars:
+    tn_user: "{{ t.users | first }}"
+
+- name: "{{ t.name }}: SSH key for the check instance"
+  community.crypto.openssh_keypair:
+    path: "{{ state_dir }}/tenants/tcheck_rsa"
+    type: rsa
+    size: 3072
+    comment: rhoso-tenant-check
+
+- name: "{{ t.name }}: public key into the pod"
+  kubernetes.core.k8s_cp:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    local_path: "{{ state_dir }}/tenants/tcheck_rsa.pub"
+    remote_path: "{{ tenant_pod_dir }}/tcheck_rsa.pub"
+    state: to_pod
+
+- name: "{{ t.name }}: as the user"
+  kubernetes.core.k8s_exec:
+    command: "{{ item }}"
+  loop:
+    - "{{ tn_os }} token issue -f json"
+    - "{{ tn_os }} hypervisor list -f json"
+    - "{{ tn_os }} image list -f json"
+    - "{{ tn_os }} network list -f json"
+    - "{{ tn_os }} keypair create tcheck --public-key {{ tenant_pod_dir }}/tcheck_rsa.pub -f json"
+  loop_control:
+    label: "{{ item | regex_replace('^.*--os-cloud \\S+ ', '') }}"
+  register: tc_basic
+  changed_when: false
+  failed_when: false
+
+- name: "{{ t.name }}: instance on {{ t.name }}-net"
+  kubernetes.core.k8s_exec:
+    command: >-
+      {{ tn_os }} server create tcheck-{{ t.name }} --flavor m1.tiny --image cirros-0.6.3 --network {{ t.name }}-net
+      --key-name tcheck --wait
+  register: tc_srv
+  changed_when: true
+  failed_when: false
+  when: t.network is defined
+
+- name: "{{ t.name }}: instance status"
+  kubernetes.core.k8s_exec:
+    command: "{{ tn_os }} server show tcheck-{{ t.name }} -f json"
+  register: tc_show
+  changed_when: false
+  failed_when: false
+  when: t.network is defined
+
+- name: "{{ t.name }}: floating IP"
+  when: >-
+    tc_show.stdout | default('') is search('"status": "ACTIVE"')
+  block:
+    - name: "{{ t.name }}: allocate"
+      kubernetes.core.k8s_exec:
+        command: "{{ tn_os }} floating ip create {{ tenant_external_network }} --description tcheck -f json"
+      register: tc_fip
+      changed_when: true
+
+    - name: "{{ t.name }}: attach"
+      kubernetes.core.k8s_exec:
+        command: "{{ tn_os }} server add floating ip tcheck-{{ t.name }} {{ (tc_fip.stdout | from_json).floating_ip_address }}"
+      changed_when: true
+
+    - name: "{{ t.name }}: SSH from the jump box, routed through the VyOS router"
+      ansible.builtin.wait_for:
+        host: "{{ (tc_fip.stdout | from_json).floating_ip_address }}"
+        port: 22
+        timeout: 300
+        search_regex: SSH
+      register: tc_ssh
+      ignore_errors: true
+
+    - name: "{{ t.name }}: the instance as a host"
+      ansible.builtin.add_host:
+        name: tcheck-{{ t.name }}
+        ansible_host: "{{ (tc_fip.stdout | from_json).floating_ip_address }}"
+        ansible_user: cirros
+        ansible_ssh_private_key_file: "{{ state_dir }}/tenants/tcheck_rsa"
+        ansible_python_interpreter: /bin/false
+      changed_when: false
+
+    - name: "{{ t.name }}: inside (MTU, DNS lab + internet name, internet)"
+      ansible.builtin.raw: "{{ item }}"
+      delegate_to: tcheck-{{ t.name }}
+      loop:
+        - cat /sys/class/net/eth0/mtu
+        - nslookup api.{{ e.domain }}
+        - nslookup registry.redhat.io
+        - ping -c 3 -W 2 1.1.1.1
+      register: tc_inside
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ t.name }}: volume, attached"
+      kubernetes.core.k8s_exec:
+        command: "{{ item }}"
+      loop:
+        - "{{ tn_os }} volume create tcheck-{{ t.name }} --size 1 -f json"
+        - "sleep 15"
+        - "{{ tn_os }} server add volume tcheck-{{ t.name }} tcheck-{{ t.name }}"
+        - "sleep 15"
+        - "{{ tn_os }} volume show tcheck-{{ t.name }} -f value -c status"
+      register: tc_vol
+      changed_when: true
+      failed_when: false
+
+- name: "{{ t.name }}: results"
+  ansible.builtin.set_fact:
+    tc_results: >-
+      {%- set b = tc_basic.results -%}
+      {%- set out = [] -%}
+      {%- set tok = (b[0].stdout | from_json) if b[0].rc | default(1) == 0 else {} -%}
+      {%- set _ = out.append(('PASS' if tok.project_id | default('') else 'FAIL') ~ ' login as ' ~ (t.users | first) ~ ' (project ' ~ tok.project_id | default('-') ~ ')') -%}
+      {%- set _ = out.append(('PASS' if b[1].rc | default(0) != 0 else 'FAIL') ~ ' admin-only call refused (hypervisor list): '
+                             ~ (b[1].stderr | default('') | trim | truncate(80))) -%}
+      {%- set _ = out.append(('PASS' if b[2].rc | default(1) == 0 and 'cirros' in b[2].stdout else 'FAIL') ~ ' sees the public image') -%}
+      {%- set _ = out.append(('PASS' if b[3].rc | default(1) == 0 and tenant_external_network in b[3].stdout else 'FAIL')
+                             ~ ' sees its network and ' ~ tenant_external_network) -%}
+      {%- if t.network is defined -%}
+      {%-   set s = (tc_show.stdout | from_json) if tc_show.rc | default(1) == 0 else {} -%}
+      {%-   set _ = out.append(('PASS' if s.status | default('') == 'ACTIVE' else 'FAIL') ~ ' instance ' ~ s.status | default('not created')
+                               ~ ((': ' ~ s.fault.message) if s.fault | default(none) else '')) -%}
+      {%-   if tc_fip is defined and tc_fip is not skipped -%}
+      {%-     set fip = (tc_fip.stdout | from_json).floating_ip_address -%}
+      {%-     set _ = out.append(('FAIL' if tc_ssh.failed | default(true) else 'PASS') ~ ' SSH from the jump box to ' ~ fip ~ ' (routed via VyOS)') -%}
+      {%-     set r = tc_inside.results | default([]) -%}
+      {%-     set _ = out.append(('PASS' if (r[0].stdout | default('') | trim) == (e.rhoso.controlplane.tenant_mtu | default(1500) | string) else 'FAIL')
+                                 ~ ' MTU ' ~ (r[0].stdout | default('?') | trim)) -%}
+      {%-     for i in [1, 2] -%}
+      {%-       set _ = out.append(('PASS' if r[i].rc | default(1) == 0 and r[i].stdout | default('') is search('Name:|canonical name') and r[i].stdout | default('') is not search("can't find|can't resolve|NXDOMAIN|timed out") else 'FAIL')
+                                   ~ ' DNS: ' ~ r[i].item | default('')) -%}
+      {%-     endfor -%}
+      {%-     set _ = out.append(('PASS' if r[3].rc | default(1) == 0 else 'FAIL') ~ ' internet from the instance: '
+                                 ~ (r[3].stdout | default('') | regex_search('[0-9]+% packet loss') | default('no reply', true))) -%}
+      {%-     set _ = out.append(('PASS' if (tc_vol.results[4].stdout | default('') | trim) == 'in-use' else 'FAIL') ~ ' volume attached: '
+                                 ~ (tc_vol.results[4].stdout | default('?') | trim)) -%}
+      {%-   endif -%}
+      {%- endif -%}
+      {{ out }}
+
+- name: "{{ t.name }}: what the tenant user saw"
+  ansible.builtin.debug:
+    var: tc_results
+
+- name: "{{ t.name }}: clean up the check objects"
+  kubernetes.core.k8s_exec:
+    command: "{{ item }}"
+  loop:
+    - "{{ tn_os }} server delete --wait tcheck-{{ t.name }}"
+    - "sleep 10"
+    - "{{ tn_os }} volume delete tcheck-{{ t.name }}"
+    - "{{ tn_os }} floating ip delete {{ (tc_fip.stdout | from_json).floating_ip_address if tc_fip is defined and tc_fip is not skipped else 'none' }}"
+    - "{{ tn_os }} keypair delete tcheck"
+    - "rm -f {{ tenant_pod_dir }}/tcheck_rsa.pub"
+  loop_control:
+    label: "{{ item | regex_replace('^.*--os-cloud \\S+ ', '') }}"
+  changed_when: true
+  failed_when: false
+
+- name: "{{ t.name }}: all checks passed"
+  ansible.builtin.assert:
+    that: tc_results | select('match', '^FAIL') | list | length == 0
+    fail_msg: "{{ tc_results | select('match', '^FAIL') | list }}"
+    quiet: true

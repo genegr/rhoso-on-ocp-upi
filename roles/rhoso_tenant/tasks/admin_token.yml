@@ -1,0 +1,62 @@
+---
+# Admin token for the Keystone API (user creation): password from osp-secret's .state copy, CA from rootca-public.
+- name: Public CA (rootca-public) for the API calls
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    namespace: "{{ rhoso_namespace }}"
+    name: rootca-public
+  register: tn_ca_secret
+  no_log: true
+
+- name: CA file
+  ansible.builtin.copy:
+    content: "{{ tn_ca_secret.resources[0].data['ca.crt'] | b64decode }}"
+    dest: "{{ state_dir }}/rhoso-public-ca.crt"
+    mode: "0644"
+
+- name: Tenant state directory
+  ansible.builtin.file:
+    path: "{{ state_dir }}/tenants"
+    state: directory
+    mode: "0700"
+
+- name: Admin token
+  ansible.builtin.uri:
+    url: "{{ tenant_keystone_url }}/v3/auth/tokens"
+    method: POST
+    ca_path: "{{ state_dir }}/rhoso-public-ca.crt"
+    body_format: json
+    body:
+      auth:
+        identity:
+          methods: [password]
+          password:
+            user:
+              name: admin
+              domain: {name: Default}
+              password: "{{ lookup('ansible.builtin.file', state_dir ~ '/osp-secret/AdminPassword') }}"
+        scope:
+          project:
+            name: admin
+            domain: {name: Default}
+    status_code: [201]
+  register: tn_auth
+  no_log: true
+
+- name: Token, domain, CA
+  ansible.builtin.set_fact:
+    tn_admin_token: "{{ tn_auth.x_subject_token }}"
+    tn_ca: "{{ state_dir }}/rhoso-public-ca.crt"
+  no_log: true
+
+- name: Domain {{ tenant_domain }}
+  ansible.builtin.uri:
+    url: "{{ tenant_keystone_url }}/v3/domains?name={{ tenant_domain }}"
+    headers: {X-Auth-Token: "{{ tn_admin_token }}"}
+    ca_path: "{{ tn_ca }}"
+  register: tn_domain
+
+- name: Domain ID
+  ansible.builtin.set_fact:
+    tn_domain_id: "{{ tn_domain.json.domains[0].id }}"

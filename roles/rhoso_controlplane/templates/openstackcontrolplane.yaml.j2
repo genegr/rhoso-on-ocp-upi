@@ -170,6 +170,18 @@ spec:
       replicas: 3
       networkAttachments:
         - internalapi
+      # Tenant (geneve) networks get tenant_mtu (default 1500: what users and images expect), carried by the
+      # tenant VLAN. Neutron takes min(global_physnet_mtu, path_mtu) - 58 (geneve over IPv4), so the underlay MTU
+      # (the tenant network's) goes into global_physnet_mtu and path_mtu = tenant_mtu + 58; physnet datacentre
+      # (provider/external VLANs) stays at 1500. Subnets without dns_nameservers get the instance DNS servers (OVN DHCP).
+      customServiceConfig: |
+        [DEFAULT]
+        global_physnet_mtu = {{ (e.rhoso.networks | selectattr('name', 'equalto', 'tenant') | first).mtu | default(1500) }}
+        [ml2]
+        path_mtu = {{ cp.tenant_mtu | default(1500) | int + 58 }}
+        physical_network_mtus = datacentre:{{ cp.datacentre_mtu | default(1500) }}
+        [ovn]
+        dns_servers = {{ cp.instance_dns_servers | default(cp.dns_forwarders) | join(',') }}
       {{ internal() | indent(6) }}
   nova:
     apiOverride:
@@ -218,6 +230,12 @@ spec:
         networkAttachment: tenant
         nicMappings:
           datacentre: {{ cp_ovn_nic }}
+        # Gateways (router external ports, SNAT) only on the computes (edpm_enable_chassis_gw; design N9). The OCP
+        # nodes' datacentre NIC is an access port group (the external VLAN arrives untagged) while the external
+        # network is a tagged VLAN: a gateway failing over to a master would break floating IPs (verify.yml's
+        # gateway report showed masters in the priority list, 2026-11-13).
+        external-ids:
+          enable-chassis-as-gateway: {{ cp.ocp_nodes_gateway | default(false) | bool | lower }}
       ovnDBCluster:
         ovndbcluster-nb:
           dbType: NB

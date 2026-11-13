@@ -76,8 +76,10 @@
       ok: null
       detail: "{{ vr_gw.bound or 'unknown' }} ({{ 'compute' if vr_gw.on_compute else 'NOT a compute: masters carry physnet datacentre untagged' }})"
     - phase: gateway
-      name: gateway chassis priorities
-      ok: null
+      name: only computes are gateway candidates (the masters carry the external VLAN untagged)
+      ok: >-
+        {{ vr_gw.priorities | length > 0 and vr_gw.priorities | map('regex_replace', ' \(.*$', '')
+           | reject('in', vr_hosts_all) | list | length == 0 }}
       detail: "{{ vr_gw.priorities | join(', ') or 'n/a' }}"
     - phase: gateway
       name: distributed floating IPs

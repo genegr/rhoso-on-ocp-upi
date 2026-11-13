@@ -1,0 +1,67 @@
+---
+# Tenant onboarding: for every entry of `tenants:` in envs/<env>.yaml a project, users with the member role (password
+# generated once into .state/<env>/tenants/<user>.password, given to the user out of band), quotas, and optionally a
+# starter network (network, subnet with Neutron's default DNS, router to the external network) owned by the tenant
+# and SSH/ICMP in its default security group. Idempotent: a second run reports changed=0.
+#   --tags check: the tenant user's view (login, admin calls refused, an instance with a floating IP reached through
+#   the router, DNS and internet inside it, a volume); its objects are removed afterwards.
+#   ansible-playbook playbooks/tenant.yml -e env=<name> [-e tenant=<name>] [--tags check]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  roles:
+    - env_model
+
+- name: Tenants
+  hosts: localhost
+  gather_facts: false
+  vars:
+    rhoso_namespace: openstack
+    tn_list: "{{ e.tenants | default([]) | selectattr('name', 'equalto', tenant) | list if tenant is defined else e.tenants | default([]) }}"
+  environment:
+    K8S_AUTH_KUBECONFIG: "/ocp/.state/clusters/{{ e.ocp_cluster }}/install/auth/kubeconfig"
+  module_defaults:
+    kubernetes.core.k8s_exec: {namespace: openstack, pod: openstackclient}
+  tasks:
+    - name: Tenants are configured
+      ansible.builtin.assert:
+        that:
+          - tn_list | length > 0
+          - tn_list | rejectattr('users', 'defined') | list | length == 0
+        fail_msg: "tenants: [{name, users: [...], quotas: {...}, network: {cidr}, open_ssh}] in envs/{{ env }}.yaml"
+        quiet: true
+      tags: [always]
+
+    - name: Admin API access
+      ansible.builtin.include_role:
+        name: rhoso_tenant
+        tasks_from: admin_token
+        apply: {tags: [always]}
+      tags: [always]
+
+    - name: Onboard
+      ansible.builtin.include_role:
+        name: rhoso_tenant
+      loop: "{{ tn_list }}"
+      loop_control:
+        loop_var: t
+        label: "{{ t.name }}"
+
+    - name: The tenant user's view
+      ansible.builtin.include_role:
+        name: rhoso_tenant
+        tasks_from: check
+        apply: {tags: [check]}
+      loop: "{{ tn_list }}"
+      loop_control:
+        loop_var: t
+        label: "{{ t.name }}"
+      tags: [never, check]
+
+    - name: Remove the clouds files from the pod
+      kubernetes.core.k8s_exec:
+        command: rm -f {{ tn_clouds_files | default([]) | join(' ') }}
+      changed_when: false
+      when: tn_clouds_files | default([]) | length > 0
+      tags: [always]

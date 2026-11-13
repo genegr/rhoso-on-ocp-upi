@@ -1,0 +1,34 @@
+---
+# A clouds file for one tenant user, copied into the openstackclient pod: tn_os runs the CLI as that user
+# (--os-cloud beats the pod's OS_CLOUD=default). The password is only in the file (0600 in .state and in the pod).
+- name: Clouds file for {{ tn_user }} ({{ t.name }})
+  ansible.builtin.copy:
+    dest: "{{ state_dir }}/tenants/{{ t.name }}-clouds.yaml"
+    mode: "0600"
+    content: |
+      clouds:
+        tenant-{{ t.name }}:
+          auth:
+            auth_url: {{ tenant_keystone_url }}
+            username: {{ tn_user }}
+            password: "{{ lookup('ansible.builtin.file', state_dir ~ '/tenants/' ~ tn_user ~ '.password') }}"
+            project_name: {{ t.name }}
+            user_domain_name: {{ tenant_domain }}
+            project_domain_name: {{ tenant_domain }}
+          region_name: regionOne
+          interface: public
+          identity_api_version: 3
+  no_log: true
+
+- name: Into the pod
+  kubernetes.core.k8s_cp:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    local_path: "{{ state_dir }}/tenants/{{ t.name }}-clouds.yaml"
+    remote_path: "{{ tenant_pod_dir }}/tenant-{{ t.name }}-clouds.yaml"
+    state: to_pod
+
+- name: CLI as {{ tn_user }}
+  ansible.builtin.set_fact:
+    tn_os: "env OS_CLIENT_CONFIG_FILE={{ tenant_pod_dir }}/tenant-{{ t.name }}-clouds.yaml openstack --os-cloud tenant-{{ t.name }}"
+    tn_clouds_files: "{{ tn_clouds_files | default([]) + [tenant_pod_dir ~ '/tenant-' ~ t.name ~ '-clouds.yaml'] }}"

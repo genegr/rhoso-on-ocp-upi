@@ -1,0 +1,165 @@
+---
+# One tenant (loop_var t): project, users with the member role, quotas, optional starter network owned by the tenant.
+# Admin calls: k8s_exec in openstackclient (OS_CLOUD=default = admin). Tenant calls: as the tenant's first user,
+# through a clouds file put into the pod (OS_CLIENT_CONFIG_FILE, --os-cloud): no password on a command line.
+- name: "{{ t.name }}: project"
+  kubernetes.core.k8s_exec:
+    command: openstack project show {{ t.name }} -f json
+  register: tn_proj
+  changed_when: false
+  failed_when: false
+
+- name: "{{ t.name }}: create the project"
+  kubernetes.core.k8s_exec:
+    command: >-
+      openstack project create {{ t.name }} --domain {{ tenant_domain }}
+      --description "{{ t.description | default('tenant ' ~ t.name) }}" -f json
+  register: tn_proj_new
+  changed_when: true
+  failed_when: tn_proj_new.rc | default(0) != 0
+  when: tn_proj.rc | default(1) != 0
+
+# Users through the Keystone API (uri), so the password never sits on a command line.
+- name: "{{ t.name }}: users"
+  ansible.builtin.uri:
+    url: "{{ tenant_keystone_url }}/v3/users?name={{ item }}&domain_id={{ tn_domain_id }}"
+    headers: {X-Auth-Token: "{{ tn_admin_token }}"}
+    ca_path: "{{ tn_ca }}"
+  loop: "{{ t.users }}"
+  register: tn_users
+  no_log: true
+
+- name: "{{ t.name }}: create the missing users (password generated once into .state/<env>/tenants/)"
+  ansible.builtin.uri:
+    url: "{{ tenant_keystone_url }}/v3/users"
+    method: POST
+    headers: {X-Auth-Token: "{{ tn_admin_token }}"}
+    ca_path: "{{ tn_ca }}"
+    body_format: json
+    body:
+      user:
+        name: "{{ item.item }}"
+        domain_id: "{{ tn_domain_id }}"
+        default_project_id: "{{ ((tn_proj_new.stdout if tn_proj_new is not skipped else tn_proj.stdout) | from_json).id }}"
+        enabled: true
+        password: "{{ lookup('ansible.builtin.password', state_dir ~ '/tenants/' ~ item.item ~ '.password', length=20,
+                             chars=['ascii_letters', 'digits']) }}"
+    status_code: [201]
+  loop: "{{ tn_users.results | selectattr('json.users', 'equalto', []) | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  changed_when: true
+  no_log: true
+
+- name: "{{ t.name }}: role assignments"
+  kubernetes.core.k8s_exec:
+    command: openstack role assignment list --project {{ t.name }} --names -f json
+  register: tn_roles
+  changed_when: false
+
+- name: "{{ t.name }}: {{ tenant_role }} role for the users"
+  kubernetes.core.k8s_exec:
+    command: openstack role add --user {{ item }} --user-domain {{ tenant_domain }} --project {{ t.name }} {{ tenant_role }}
+  loop: >-
+    {{ t.users | reject('in', tn_roles.stdout | from_json | selectattr('Role', 'equalto', tenant_role)
+       | map(attribute='User') | map('regex_replace', '@.*$', '') | list) | list }}
+  register: tn_role_add
+  changed_when: true
+  failed_when: tn_role_add.rc | default(0) != 0
+
+- name: "{{ t.name }}: quotas (current)"
+  kubernetes.core.k8s_exec:
+    command: openstack quota show {{ t.name }} -f json
+  register: tn_quota
+  changed_when: false
+  when: t.quotas | default({}) | length > 0
+
+# quota show prints a list of {Resource, Limit} or a dict, depending on the client: normalise both.
+- name: "{{ t.name }}: quotas that differ"
+  ansible.builtin.set_fact:
+    tn_quota_diff: >-
+      {%- set raw = tn_quota.stdout | from_json -%}
+      {%- set now = (raw | items2dict(key_name='Resource', value_name='Limit')) if raw is sequence and raw is not string else raw -%}
+      {%- set out = {} -%}
+      {%- for k, v in t.quotas.items() -%}
+      {%-   set cur = now[k] | default(now[k | replace('-', '_')] | default(none)) -%}
+      {%-   if cur is none or cur | int != v | int -%}{%- set _ = out.update({k: v}) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  when: t.quotas | default({}) | length > 0
+
+- name: "{{ t.name }}: set them"
+  kubernetes.core.k8s_exec:
+    command: >-
+      openstack quota set {{ tn_quota_diff.items() | map('join', ' ') | map('regex_replace', '^', '--') | join(' ') }} {{ t.name }}
+  register: tn_quota_set
+  changed_when: true
+  failed_when: tn_quota_set.rc | default(0) != 0
+  when: tn_quota_diff | default({}) | length > 0
+
+# --- as the tenant's first user -------------------------------------------------------------------------------------
+- name: "{{ t.name }}: clouds file for the tenant user (in the pod, removed at the end)"
+  ansible.builtin.include_tasks: as_user.yml
+  vars:
+    tn_user: "{{ t.users | first }}"
+
+- name: "{{ t.name }}: starter network"
+  when: t.network is defined
+  block:
+    - name: "{{ t.name }}: the tenant's networks and routers"
+      kubernetes.core.k8s_exec:
+        command: "{{ item }}"
+      loop:
+        - "{{ tn_os }} network list -f json"
+        - "{{ tn_os }} router list -f json"
+      register: tn_net_now
+      changed_when: false
+      failed_when: tn_net_now.rc | default(0) != 0
+      no_log: false
+
+    - name: "{{ t.name }}: network, subnet (DNS from Neutron's default), router to {{ tenant_external_network }}"
+      kubernetes.core.k8s_exec:
+        command: "{{ item }}"
+      loop:
+        - "{{ tn_os }} network create {{ t.name }}-net"
+        - "{{ tn_os }} subnet create {{ t.name }}-subnet --network {{ t.name }}-net --subnet-range {{ t.network.cidr }}"
+        - "{{ tn_os }} router create {{ t.name }}-router"
+        - "{{ tn_os }} router set {{ t.name }}-router --external-gateway {{ tenant_external_network }}"
+        - "{{ tn_os }} router add subnet {{ t.name }}-router {{ t.name }}-subnet"
+      loop_control:
+        label: "{{ item | regex_replace('^.*openstack --os-cloud \\S+ ', '') }}"
+      register: tn_net_new
+      changed_when: true
+      failed_when: tn_net_new.rc | default(0) != 0
+      when: (t.name ~ '-net') not in (tn_net_now.results[0].stdout | from_json | map(attribute='Name'))
+
+- name: "{{ t.name }}: SSH and ICMP into the default security group"
+  when: t.open_ssh | default(false) | bool
+  block:
+    - name: "{{ t.name }}: default security group rules"
+      kubernetes.core.k8s_exec:
+        command: "{{ tn_os }} security group rule list default -f json"
+      register: tn_sg
+      changed_when: false
+
+    - name: "{{ t.name }}: add the missing ones"
+      kubernetes.core.k8s_exec:
+        command: "{{ tn_os }} security group rule create default --ingress {{ item.args }}"
+      loop:
+        - {proto: icmp, port: null, args: "--protocol icmp"}
+        - {proto: tcp, port: "22:22", args: "--protocol tcp --dst-port 22"}
+      loop_control:
+        label: "{{ item.proto }}"
+      when: >-
+        tn_sg.stdout | from_json | selectattr('Direction', 'equalto', 'ingress')
+        | selectattr('IP Protocol', 'equalto', item.proto) | selectattr('Port Range', 'equalto', item.port | default('', true) | string)
+        | list | length == 0
+      register: tn_sg_add
+      changed_when: true
+      failed_when: tn_sg_add.rc | default(0) != 0
+
+- name: "{{ t.name }}: summary"
+  ansible.builtin.debug:
+    msg: >-
+      project {{ t.name }}, users {{ t.users | join(', ') }} ({{ tenant_role }}; passwords in
+      .state/{{ env }}/tenants/<user>.password){{ ', network ' ~ t.network.cidr if t.network is defined else '' }}

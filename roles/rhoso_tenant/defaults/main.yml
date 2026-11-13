@@ -1,0 +1,12 @@
+---
+# Tenant onboarding (playbooks/tenant.yml). Per tenant in envs/<env>.yaml `tenants:`
+#   {name, description, users: [names], quotas: {...}, network: {cidr} (optional starter network), open_ssh: bool}
+# Users get the `member` role and a password generated once into .state/<env>/tenants/<user>.password.
+tenant_role: member
+tenant_domain: Default
+tenant_keystone_url: "https://keystone-public-openstack.apps.{{ e.domain }}"
+tenant_pod_dir: /home/cloud-admin
+tenant_external_network: public          # verify.yml's kept external network (floating IPs)
+# Quota keys as `openstack quota set` takes them (--<key> <value>); anything not listed keeps the cloud default.
+tenant_quota_keys: [instances, cores, ram, volumes, gigabytes, snapshots, floating-ips, networks, routers, ports,
+                    secgroups, secgroup-rules]
