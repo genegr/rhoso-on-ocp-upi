@@ -1,0 +1,88 @@
+---
+# Report only: which OVN chassis holds the router's gateway port (masters and computes are both gateway chassis, and
+# physnet datacentre is untagged VLAN on the masters but tagged on the computes), and whether FIPs are distributed.
+- name: Router gateway port
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} port list --router {{ verify_prefix }}-router --device-owner network:router_gateway -f json"
+  register: vr_gwport
+  changed_when: false
+  failed_when: vr_gwport.rc | default(0) != 0
+
+- name: Gateway chassis priorities (OVN NB)
+  kubernetes.core.k8s_exec:
+    pod: ovsdbserver-nb-0
+    container: ovsdbserver-nb
+    command: ovn-nbctl --no-leader-only lrp-get-gateway-chassis lrp-{{ (vr_gwport.stdout | from_json | first).ID }}
+  register: vr_gwch
+  changed_when: false
+  failed_when: false
+  when: vr_gwport.stdout | from_json | length > 0
+
+- name: Chassis names (OVN SB)
+  kubernetes.core.k8s_exec:
+    pod: ovsdbserver-sb-0
+    container: ovsdbserver-sb
+    command: ovn-sbctl --no-leader-only --format=csv --data=bare --no-headings --columns=name,hostname list Chassis
+  register: vr_chassis
+  changed_when: false
+  failed_when: false
+
+- name: Where the gateway is bound (port binding host)
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} port show {{ (vr_gwport.stdout | from_json | first).ID }} -f json"
+  register: vr_gwshow
+  changed_when: false
+  failed_when: false
+  when: vr_gwport.stdout | from_json | length > 0
+
+- name: Neutron API pods
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ rhoso_namespace }}"
+    label_selectors: [service=neutron]
+  register: vr_neutron_pods
+
+- name: Distributed floating IPs setting (neutron-api)
+  kubernetes.core.k8s_exec:
+    pod: "{{ vr_neutron_pods.resources | map(attribute='metadata.name') | select('match', '^neutron-[a-z0-9]+-[a-z0-9]+$') | first }}"
+    container: neutron-api
+    command: grep -rh enable_distributed_floating_ip /etc/neutron/neutron.conf.d/
+  register: vr_dfip
+  changed_when: false
+  failed_when: false
+  when: vr_neutron_pods.resources | map(attribute='metadata.name') | select('match', '^neutron-[a-z0-9]+-[a-z0-9]+$') | list | length > 0
+
+- name: Summary
+  ansible.builtin.set_fact:
+    vr_gw: >-
+      {%- set names = {} -%}
+      {%- for l in (vr_chassis.stdout | default('')).splitlines() if ',' in l -%}
+      {%-   set _ = names.update({l.split(',')[0]: l.split(',')[1]}) -%}
+      {%- endfor -%}
+      {%- set prio = [] -%}
+      {%- for l in (vr_gwch.stdout | default('')).splitlines() if l | trim -%}
+      {%-   set ch = (l.split() | first).split('_', 1) | last -%}
+      {%-   set _ = prio.append(names[ch] | default(ch) ~ ' (' ~ (l.split() | last) ~ ')') -%}
+      {%- endfor -%}
+      {%- set bound = ((vr_gwshow.stdout | default('{}')) | from_json).binding_host_id | default('') -%}
+      {{ {'priorities': prio, 'bound': bound, 'on_compute': bound in vr_hosts_all,
+          'distributed_fip': (vr_dfip.stdout | default('') | trim) or 'not set (default)'} }}
+
+- name: Checks
+  ansible.builtin.include_tasks: check.yml
+  loop:
+    - phase: gateway
+      name: router gateway bound to
+      ok: null
+      detail: "{{ vr_gw.bound or 'unknown' }} ({{ 'compute' if vr_gw.on_compute else 'NOT a compute: masters carry physnet datacentre untagged' }})"
+    - phase: gateway
+      name: gateway chassis priorities
+      ok: null
+      detail: "{{ vr_gw.priorities | join(', ') or 'n/a' }}"
+    - phase: gateway
+      name: distributed floating IPs
+      ok: null
+      detail: "{{ vr_gw.distributed_fip }}"
+  loop_control:
+    loop_var: chk
+    label: "{{ chk.name }}"

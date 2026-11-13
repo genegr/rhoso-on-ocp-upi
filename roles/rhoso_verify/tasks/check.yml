@@ -1,0 +1,9 @@
+---
+# Record one result. vars: chk = {phase, name, ok: true|false|none (none = INFO), detail}
+- name: "{{ chk.phase }}: {{ chk.name }}"
+  ansible.builtin.set_fact:
+    vr_checks: >-
+      {{ vr_checks | default([]) + [{
+           'phase': chk.phase, 'name': chk.name,
+           'status': 'INFO' if chk.ok is none else ('PASS' if chk.ok | bool else 'FAIL'),
+           'detail': chk.detail | default('') | string}] }}

@@ -1,0 +1,53 @@
+---
+# Live migration of the first instance (local disk + the attached Pure volume) to another compute.
+- name: Target compute
+  ansible.builtin.set_fact:
+    vr_mig_target: "{{ vr_hosts | reject('equalto', vr_vms[0].host) | first }}"
+
+- name: Live-migrate {{ vr_vms[0].name }} from {{ vr_vms[0].host }} to {{ vr_mig_target }}
+  kubernetes.core.k8s_exec:
+    # --host needs compute API 2.30; block migration is "auto" from 2.25 (local disk is not shared)
+    command: >-
+      {{ vos }} --os-compute-api-version 2.30 server migrate --live-migration --host {{ vr_mig_target }}
+      --wait {{ vr_vms[0].id }}
+  register: vr_mig
+  changed_when: true
+  failed_when: false
+
+- name: After the migration
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} server show {{ vr_vms[0].id }} -f json"
+  register: vr_mig_show
+  changed_when: false
+  failed_when: vr_mig_show.rc | default(0) != 0
+
+- name: Still reachable on its floating IP
+  ansible.builtin.wait_for:
+    host: "{{ vr_vms[0].fip }}"
+    port: 22
+    timeout: 120
+    search_regex: SSH
+  register: vr_mig_ssh
+  ignore_errors: true
+
+- name: The volume's marker is still there
+  ansible.builtin.raw: sudo dd if=/dev/vdb bs=512 count=1 2>/dev/null | head -c {{ verify_marker | length }}
+  delegate_to: "{{ vr_vms[0].name }}"
+  register: vr_mig_marker
+  changed_when: false
+  failed_when: false
+
+- name: Checks
+  ansible.builtin.include_tasks: check.yml
+  loop:
+    - phase: migration
+      name: live migration to {{ vr_mig_target.split('.')[0] }}
+      ok: "{{ (vr_mig_show.stdout | from_json)['OS-EXT-SRV-ATTR:host'] == vr_mig_target and (vr_mig_show.stdout | from_json).status == 'ACTIVE' }}"
+      detail: "{{ (vr_mig_show.stdout | from_json).status }} on {{ (vr_mig_show.stdout | from_json)['OS-EXT-SRV-ATTR:host'] }}{{ (' / ' ~ (vr_mig.stderr | default('') | trim | truncate(200))) if vr_mig.rc | default(0) != 0 else '' }}"
+    - phase: migration
+      name: reachable after the migration, volume data intact
+      ok: "{{ not (vr_mig_ssh.failed | default(true)) and (vr_mig_marker.stdout | default('') | trim) == verify_marker }}"
+      detail: "{{ vr_vms[0].fip }}, marker '{{ vr_mig_marker.stdout | default('') | trim }}'"
+  loop_control:
+    loop_var: chk
+    label: "{{ chk.name }}"

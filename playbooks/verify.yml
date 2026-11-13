@@ -1,0 +1,306 @@
+---
+# Functional verification of the RHOSO cloud (README phase 6), before Tempest. Report: .state/<env>/verify-report.md.
+#   base       kept: external network + floating-IP subnet, flavors, CirrOS image (Glance on Cinder / Pure)
+#   smoke      project rhoso-verify: tenant network, router, one instance per compute with a floating IP;
+#              placement, metadata key, DHCP, MTU, north-south SSH, east-west pings
+#   gateway    report only: which chassis holds the router gateway, distributed floating IPs
+#   storage    Pure volume attached (multipath + both iSCSI fabrics on the compute, write/read in the guest),
+#              boot from volume
+#   migration  live migration of the instance with the attached volume
+# Floating IPs are reached through a temporary leg on the jump box: the netcheck test vNIC on the external port group
+# (hot-added, removed at the end) with rhoso.verify.jumpbox_ip. Everything in the project is removed at the end
+# (-e keep=true keeps it; --tags cleanup removes it later). base and smoke are prerequisites of the other phases:
+# narrow a run with --skip-tags (e.g. migration), not --tags.
+# Changes vSphere, the jump box and the cloud: --check --diff first (prints the plan, changes nothing), then the
+# user's go-ahead.
+#   ansible-playbook playbooks/verify.yml -e env=<name> [--skip-tags migration] [-e keep=true] [--tags cleanup]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  roles:
+    - env_model
+
+- name: Preflight
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  vars:
+    rhoso_namespace: openstack
+  environment:
+    K8S_AUTH_KUBECONFIG: "/ocp/.state/clusters/{{ e.ocp_cluster }}/install/auth/kubeconfig"
+  module_defaults:
+    kubernetes.core.k8s_exec: {namespace: openstack, pod: openstackclient}
+  tasks:
+    - name: State directory
+      ansible.builtin.file:
+        path: "{{ state_dir }}/verify"
+        state: directory
+        mode: "0700"
+      check_mode: false
+
+    - name: Preflight (read-only)
+      ansible.builtin.include_role:
+        name: rhoso_verify
+        tasks_from: preflight
+
+# ---------------------------------------------------------------------------------------------------------------
+- name: Jump box test leg - vNIC on the external port group (vSphere)
+  hosts: localhost
+  gather_facts: false
+  tags: [base, smoke, gateway, storage, migration]
+  module_defaults:
+    group/community.vmware.vmware:
+      hostname: "{{ e.vsphere.server }}"
+      username: "{{ vault_vsphere_user }}"
+      password: "{{ vault_vsphere_password }}"
+      validate_certs: false
+  vars:
+    vr_leg_pg: "{{ (e.jumpbox.test_nics | selectattr('network', 'equalto', 'external') | first).portgroup }}"
+  tasks:
+    - name: Jump box vNICs
+      community.vmware.vmware_guest_network:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ e.jumpbox.vm.name }}"
+        gather_network_info: true
+      register: vr_jb_nics
+
+    - name: Test vNIC on {{ vr_leg_pg }} (added only if missing)
+      community.vmware.vmware_guest_network:
+        datacenter: "{{ e.vsphere.datacenter }}"
+        name: "{{ e.jumpbox.vm.name }}"
+        network_name: "{{ vr_leg_pg }}"
+        device_type: vmxnet3
+        connected: true
+        start_connected: true
+        state: present
+      register: vr_jb_add
+      when: vr_leg_pg not in vr_jb_nics.network_info | map(attribute='network_name')
+
+    - name: Its MAC
+      ansible.builtin.set_fact:
+        vr_leg_mac: >-
+          {{ ((vr_jb_add.network_info | default(vr_jb_nics.network_info, true)) | selectattr('network_name', 'equalto', vr_leg_pg)
+              | map(attribute='mac_address') | first | default('')) | lower }}
+
+- name: Jump box test leg - address (systemd-networkd)
+  hosts: jumpbox
+  gather_facts: false
+  tags: [base, smoke, gateway, storage, migration]
+  vars:
+    vr_l: "{{ hostvars['localhost'] }}"
+  tasks:
+    - name: Interface with that MAC (the hot-added NIC can take a few seconds)
+      ansible.builtin.setup:
+        gather_subset: [network]
+      register: vr_jb_facts
+      until: >-
+        vr_jb_facts.ansible_facts.ansible_interfaces | map('regex_replace', '-', '_') | map('regex_replace', '^', 'ansible_')
+        | map('extract', vr_jb_facts.ansible_facts) | selectattr('macaddress', 'defined')
+        | selectattr('macaddress', 'equalto', vr_l.vr_leg_mac) | list | length > 0
+      retries: 12
+      delay: 5
+      when: vr_l.vr_leg_mac | length > 0 and not ansible_check_mode
+
+    - name: Leg interface
+      ansible.builtin.set_fact:
+        vr_leg_if: >-
+          {{ ansible_facts.interfaces | map('regex_replace', '-', '_') | map('extract', ansible_facts) | selectattr('macaddress', 'defined')
+             | selectattr('macaddress', 'equalto', vr_l.vr_leg_mac) | map(attribute='device') | first | default('') }}
+      when: vr_l.vr_leg_mac | length > 0 and not ansible_check_mode
+
+    - name: Would configure (check mode)
+      ansible.builtin.debug:
+        msg: "/etc/systemd/network/90-rhoso-verify.network: {{ vr_l.vr.jumpbox_ip }}/{{ vr_l.vr_ext.cidr.split('/')[1] }}
+              on the new vNIC, then ping the floating-IP pool before Neutron owns it"
+      when: ansible_check_mode
+
+    - name: Test address {{ vr_l.vr.jumpbox_ip }} on it (no gateway; removed at the end)
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/90-rhoso-verify.network
+        mode: "0644"
+        content: |
+          # Managed by rhoso-on-ocp-upi verify.yml - temporary
+          [Match]
+          MACAddress={{ vr_l.vr_leg_mac }}
+          [Link]
+          RequiredForOnline=no
+          [Network]
+          LinkLocalAddressing=no
+          ConfigureWithoutCarrier=yes
+          Address={{ vr_l.vr.jumpbox_ip }}/{{ vr_l.vr_ext.cidr.split('/')[1] }}
+      register: vr_netd
+      when: vr_leg_if | default('') | length > 0
+
+    - name: Apply
+      ansible.builtin.systemd_service:
+        name: systemd-networkd
+        state: restarted
+      when: vr_netd is changed
+
+    - name: Address is up
+      ansible.builtin.wait_for:
+        host: "{{ vr_l.vr.jumpbox_ip }}"
+        port: 22
+        timeout: 30
+      when: not ansible_check_mode and vr_leg_if | default('') | length > 0
+
+    # Before Neutron owns the pool (first run): nothing may answer there.
+    - name: Floating-IP pool is unused
+      ansible.builtin.command: ping -c 1 -W 1 {{ item }}
+      loop: "{{ vr_l.vr_pool_ips }}"
+      register: vr_pool_ping
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: not vr_l.vr_ext_exists and not ansible_check_mode
+
+# ---------------------------------------------------------------------------------------------------------------
+- name: Verification
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  vars:
+    rhoso_namespace: openstack
+  environment:
+    K8S_AUTH_KUBECONFIG: "/ocp/.state/clusters/{{ e.ocp_cluster }}/install/auth/kubeconfig"
+  module_defaults:
+    kubernetes.core.k8s_exec: {namespace: openstack, pod: openstackclient}
+  tasks:
+    - name: Check mode stops here (the plan is printed above)
+      ansible.builtin.meta: end_play
+      when: ansible_check_mode
+
+    - name: Phases
+      tags: [base, smoke, gateway, storage, migration]
+      block:
+        - name: Floating-IP pool unused (checked from the test leg)
+          ansible.builtin.assert:
+            that: hostvars['jumpbox'].vr_pool_ping.results | default([]) | selectattr('rc', 'defined')
+                  | selectattr('rc', 'equalto', 0) | list | length == 0
+            fail_msg: >-
+              answering in the pool: {{ hostvars['jumpbox'].vr_pool_ping.results | selectattr('rc', 'defined')
+              | selectattr('rc', 'equalto', 0) | map(attribute='item') | join(', ') }}
+            quiet: true
+          when: not vr_ext_exists
+
+        - name: base
+          ansible.builtin.include_role:
+            name: rhoso_verify
+            tasks_from: base
+            apply: {tags: [base]}
+          tags: [base]
+
+        - name: smoke
+          ansible.builtin.include_role:
+            name: rhoso_verify
+            tasks_from: smoke
+            apply: {tags: [smoke]}
+          tags: [smoke]
+
+        - name: gateway
+          ansible.builtin.include_role:
+            name: rhoso_verify
+            tasks_from: gateway
+            apply: {tags: [gateway]}
+          tags: [gateway]
+
+        - name: storage
+          ansible.builtin.include_role:
+            name: rhoso_verify
+            tasks_from: storage
+            apply: {tags: [storage]}
+          tags: [storage]
+          when: vr_vms | default([]) | length > 0
+
+        - name: migration
+          ansible.builtin.include_role:
+            name: rhoso_verify
+            tasks_from: migration
+            apply: {tags: [migration]}
+          tags: [migration]
+          when: vr_vms | default([]) | length > 1
+      rescue:
+        - name: Record the abort
+          ansible.builtin.include_role:
+            name: rhoso_verify
+            tasks_from: check
+          vars:
+            chk:
+              phase: aborted
+              name: "{{ ansible_failed_task.name | default('?') }}"
+              ok: false
+              detail: "{{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('')) | truncate(300) }}"
+
+    - name: Cleanup
+      ansible.builtin.include_role:
+        name: rhoso_verify
+        tasks_from: cleanup
+      when: not (keep | default(false) | bool)
+
+    - name: Report
+      ansible.builtin.include_role:
+        name: rhoso_verify
+        tasks_from: report
+      when: vr_checks is defined
+
+# ---------------------------------------------------------------------------------------------------------------
+- name: Jump box test leg - remove the address
+  hosts: jumpbox
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: networkd file
+      ansible.builtin.file:
+        path: /etc/systemd/network/90-rhoso-verify.network
+        state: absent
+      register: vr_netd_rm
+      when: not (keep | default(false) | bool)
+
+    - name: Apply
+      ansible.builtin.systemd_service:
+        name: systemd-networkd
+        state: restarted
+      when: vr_netd_rm is changed
+
+- name: Jump box test leg - remove the vNIC (vSphere)
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  module_defaults:
+    group/community.vmware.vmware:
+      hostname: "{{ e.vsphere.server }}"
+      username: "{{ vault_vsphere_user }}"
+      password: "{{ vault_vsphere_password }}"
+      validate_certs: false
+  vars:
+    vr_leg_pg: "{{ (e.jumpbox.test_nics | selectattr('network', 'equalto', 'external') | first).portgroup }}"
+  tasks:
+    - name: Remove it
+      when: not (keep | default(false) | bool)
+      block:
+        - name: Jump box vNICs
+          community.vmware.vmware_guest_network:
+            datacenter: "{{ e.vsphere.datacenter }}"
+            name: "{{ e.jumpbox.vm.name }}"
+            gather_network_info: true
+          register: vr_jb_nics_end
+
+        - name: Test vNIC on {{ vr_leg_pg }}
+          community.vmware.vmware_guest_network:
+            datacenter: "{{ e.vsphere.datacenter }}"
+            name: "{{ e.jumpbox.vm.name }}"
+            mac_address: "{{ item.mac_address }}"
+            state: absent
+          loop: "{{ vr_jb_nics_end.network_info | selectattr('network_name', 'equalto', vr_leg_pg) | list }}"
+          loop_control:
+            label: "{{ item.network_name }} {{ item.mac_address }}"
+
+    - name: Result
+      ansible.builtin.assert:
+        that: vr_checks | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length == 0
+        fail_msg: >-
+          {{ vr_checks | selectattr('status', 'equalto', 'FAIL') | map(attribute='name') | join('; ') }}
+          (see .state/{{ env }}/verify-report.md)
+        success_msg: "verification passed (.state/{{ env }}/verify-report.md)"
+      when: vr_checks is defined

@@ -1,0 +1,139 @@
+---
+# Pure iSCSI from the computes: a volume attached to the first instance (multipath on its compute, write/read in the
+# guest), and an instance booted from a volume.
+- name: Volume {{ verify_prefix }}-vol ({{ verify_volume_gb }} GB, type {{ cinder_volume_type | default('pure') }})
+  kubernetes.core.k8s_exec:
+    command: >-
+      {{ vos }} volume create {{ verify_prefix }}-vol --size {{ verify_volume_gb }}
+      --type {{ cinder_volume_type | default('pure') }} -f json
+  register: vr_vol
+  changed_when: true
+  failed_when: vr_vol.rc | default(0) != 0
+
+- name: Volume available
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} volume show {{ verify_prefix }}-vol -f value -c status"
+  register: vr_vol_state
+  until: vr_vol_state.stdout | trim in ['available', 'error']
+  retries: 30
+  delay: 5
+  changed_when: false
+  failed_when: vr_vol_state.stdout | trim != 'available'
+
+- name: Attach it to {{ vr_vms[0].name }}
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} server add volume {{ vr_vms[0].id }} {{ verify_prefix }}-vol"
+  register: vr_attach
+  changed_when: true
+  failed_when: vr_attach.rc | default(0) != 0
+
+- name: Volume in-use
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} volume show {{ verify_prefix }}-vol -f value -c status"
+  register: vr_vol_state
+  until: vr_vol_state.stdout | trim in ['in-use', 'error', 'error_attaching']
+  retries: 30
+  delay: 5
+  changed_when: false
+  failed_when: false
+
+- name: Multipath on {{ vr_vms[0].host }}
+  ansible.builtin.command: multipath -ll
+  delegate_to: "{{ vr_vms[0].host.split('.')[0] }}"
+  register: vr_mp
+  changed_when: false
+  failed_when: false
+
+- name: iSCSI sessions on {{ vr_vms[0].host }}
+  ansible.builtin.command: iscsiadm -m session
+  delegate_to: "{{ vr_vms[0].host.split('.')[0] }}"
+  register: vr_iscsi
+  changed_when: false
+  failed_when: false
+
+- name: The disk inside the guest
+  ansible.builtin.raw: test -b /dev/vdb && echo present
+  delegate_to: "{{ vr_vms[0].name }}"
+  register: vr_vdb
+  until: "'present' in vr_vdb.stdout | default('')"
+  retries: 12
+  delay: 5
+  changed_when: false
+  failed_when: false
+
+- name: Write a marker and read it back (raw device, then dropped caches)
+  ansible.builtin.raw: >-
+    echo {{ verify_marker }} | sudo dd of=/dev/vdb bs=512 count=1 conv=sync,fsync 2>/dev/null &&
+    sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' &&
+    sudo dd if=/dev/vdb bs=512 count=1 2>/dev/null | head -c {{ verify_marker | length }}
+  delegate_to: "{{ vr_vms[0].name }}"
+  register: vr_marker
+  changed_when: false
+  failed_when: false
+  when: "'present' in vr_vdb.stdout | default('')"
+
+- name: Boot-from-volume instance on {{ vr_hosts[1] | default(vr_hosts[0]) }}
+  kubernetes.core.k8s_exec:
+    command: >-
+      {{ vos }} server create {{ verify_prefix }}-bfv --flavor {{ verify_flavors[1].name }} --image {{ verify_image.name }}
+      --boot-from-volume {{ verify_volume_gb }} --network {{ verify_prefix }}-net --security-group {{ verify_prefix }}-sg
+      --key-name {{ verify_keypair }} --availability-zone nova:{{ vr_hosts[1] | default(vr_hosts[0]) }} --wait -f json
+  register: vr_bfv
+  changed_when: true
+  failed_when: false
+
+- name: Floating IP for it
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} floating ip create {{ verify_external_network }} -f json"
+  register: vr_bfv_fip
+  changed_when: true
+  failed_when: vr_bfv_fip.rc | default(0) != 0
+  when: vr_bfv.rc | default(1) == 0
+
+- name: Attach it
+  kubernetes.core.k8s_exec:
+    command: >-
+      {{ vos }} server add floating ip {{ verify_prefix }}-bfv {{ (vr_bfv_fip.stdout | from_json).floating_ip_address }}
+  register: vr_bfv_add
+  changed_when: true
+  failed_when: vr_bfv_add.rc | default(0) != 0
+  when: vr_bfv.rc | default(1) == 0
+
+- name: SSH on the boot-from-volume instance
+  ansible.builtin.wait_for:
+    host: "{{ (vr_bfv_fip.stdout | from_json).floating_ip_address }}"
+    port: 22
+    timeout: 300
+    search_regex: SSH
+  register: vr_bfv_ssh
+  ignore_errors: true
+  when: vr_bfv.rc | default(1) == 0
+
+- name: Checks
+  ansible.builtin.include_tasks: check.yml
+  loop:
+    - phase: storage
+      name: volume attached (in-use)
+      ok: "{{ vr_vol_state.stdout | default('') | trim == 'in-use' }}"
+      detail: "{{ vr_vol_state.stdout | default('') | trim }}"
+    - phase: storage
+      name: "multipath on {{ vr_vms[0].host.split('.')[0] }}: PURE device, >= 2 active paths"
+      ok: "{{ 'PURE' in vr_mp.stdout | default('') and (vr_mp.stdout | default('') | regex_findall('active ready running') | length) >= 2 }}"
+      detail: "{{ vr_mp.stdout | default('') | regex_findall('active ready running') | length }} active paths"
+    - phase: storage
+      name: "iSCSI sessions on both fabrics"
+      ok: >-
+        {{ e.flasharray.iscsi_portals.storage | select('in', vr_iscsi.stdout | default('')) | list | length > 0
+           and e.flasharray.iscsi_portals.storage_b | select('in', vr_iscsi.stdout | default('')) | list | length > 0 }}
+      detail: "{{ vr_iscsi.stdout_lines | default([]) | length }} sessions"
+    - phase: storage
+      name: guest writes and reads the volume
+      ok: "{{ (vr_marker.stdout | default('') | trim) == verify_marker }}"
+      detail: "{{ 'no /dev/vdb in the guest' if 'present' not in vr_vdb.stdout | default('') else (vr_marker.stdout | default('') | trim) }}"
+    - phase: storage
+      name: boot-from-volume instance ACTIVE and reachable
+      ok: "{{ vr_bfv.rc | default(1) == 0 and (vr_bfv.stdout | from_json).status == 'ACTIVE' and not (vr_bfv_ssh.failed | default(true)) }}"
+      detail: "{{ ((vr_bfv.stdout | from_json).status ~ ' ' ~ (vr_bfv_fip.stdout | from_json).floating_ip_address) if vr_bfv.rc | default(1) == 0 else (vr_bfv.stderr | default('') | trim | truncate(200)) }}"
+  loop_control:
+    loop_var: chk
+    label: "{{ chk.name }}"

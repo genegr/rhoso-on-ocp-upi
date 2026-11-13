@@ -1,0 +1,116 @@
+---
+# Remove the project and everything in it, and the keypair. Tolerates a partial run (everything is looked up first).
+# The kept objects (external network, flavors, image) are never touched.
+- name: Projects
+  kubernetes.core.k8s_exec:
+    command: openstack project list -f json
+  register: vr_c_projects
+  changed_when: false
+  failed_when: vr_c_projects.rc | default(0) != 0
+
+- name: Project resources
+  when: verify_project in (vr_c_projects.stdout | from_json | map(attribute='Name'))
+  block:
+    - name: Servers, floating IPs, volumes, routers (current)
+      kubernetes.core.k8s_exec:
+        command: "{{ item }}"
+      loop:
+        - "{{ vos }} server list -f json"
+        - "{{ vos }} floating ip list --project {{ verify_project }} -f json"
+        - "{{ vos }} router list --project {{ verify_project }} -f json"
+        - "{{ vos }} network list --project {{ verify_project }} -f json"
+        - "{{ vos }} security group list --project {{ verify_project }} -f json"
+      register: vr_c
+      changed_when: false
+      failed_when: vr_c.rc | default(0) != 0
+
+    - name: Delete the instances
+      kubernetes.core.k8s_exec:
+        command: "{{ vos }} server delete --wait {{ (vr_c.results[0].stdout | from_json | map(attribute='ID')) | join(' ') }}"
+      when: vr_c.results[0].stdout | from_json | length > 0
+      register: vr_c_srv
+      changed_when: true
+      failed_when: vr_c_srv.rc | default(0) != 0
+
+    - name: Delete the floating IPs
+      kubernetes.core.k8s_exec:
+        command: "{{ vos }} floating ip delete {{ (vr_c.results[1].stdout | from_json | map(attribute='ID')) | join(' ') }}"
+      when: vr_c.results[1].stdout | from_json | length > 0
+      changed_when: true
+
+    # Detached once the servers are gone (the boot-from-volume root volume is deleted with its server only when
+    # created with delete_on_termination, which --boot-from-volume does not set): delete whatever is left.
+    - name: Volumes (current)
+      kubernetes.core.k8s_exec:
+        command: "{{ vos }} volume list -f json"
+      register: vr_c_vols
+      changed_when: false
+      until: vr_c_vols.stdout | from_json | selectattr('Status', 'in', ['detaching', 'deleting', 'in-use']) | list | length == 0
+      retries: 24
+      delay: 5
+
+    - name: Delete the volumes
+      kubernetes.core.k8s_exec:
+        command: "{{ vos }} volume delete {{ (vr_c_vols.stdout | from_json | map(attribute='ID')) | join(' ') }}"
+      when: vr_c_vols.stdout | from_json | length > 0
+      register: vr_c_vol_del
+      changed_when: true
+      failed_when: vr_c_vol_del.rc | default(0) != 0
+
+    - name: Routers (gateway, subnets, router)
+      kubernetes.core.k8s_exec:
+        command: "{{ item }}"
+      loop: >-
+        {%- set out = [] -%}
+        {%- for r in vr_c.results[2].stdout | from_json -%}
+        {%-   set _ = out.append(vos ~ ' router unset --external-gateway ' ~ r.ID) -%}
+        {%-   set _ = out.append(vos ~ ' router remove subnet ' ~ r.ID ~ ' ' ~ verify_prefix ~ '-subnet') -%}
+        {%-   set _ = out.append(vos ~ ' router delete ' ~ r.ID) -%}
+        {%- endfor -%}
+        {{ out }}
+      register: vr_c_rtr
+      changed_when: true
+      failed_when: vr_c_rtr.rc | default(0) != 0 and item is search(' router delete ')
+
+    - name: Networks, security groups (the project's default group goes with the project)
+      kubernetes.core.k8s_exec:
+        command: "{{ item }}"
+      loop: >-
+        {{ (vr_c.results[3].stdout | from_json | map(attribute='ID') | map('regex_replace', '^', vos ~ ' network delete ') | list)
+           + (vr_c.results[4].stdout | from_json | rejectattr('Name', 'equalto', 'default') | map(attribute='ID')
+              | map('regex_replace', '^', vos ~ ' security group delete ') | list) }}
+      register: vr_c_net
+      changed_when: true
+      failed_when: vr_c_net.rc | default(0) != 0
+
+    - name: Default security group of the project
+      kubernetes.core.k8s_exec:
+        command: "{{ vos }} security group delete {{ item.ID }}"
+      loop: "{{ vr_c.results[4].stdout | from_json | selectattr('Name', 'equalto', 'default') | list }}"
+      loop_control:
+        label: "{{ item.ID }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Delete the project
+      kubernetes.core.k8s_exec:
+        command: openstack project delete {{ verify_project }}
+      register: vr_c_proj
+      changed_when: true
+      failed_when: vr_c_proj.rc | default(0) != 0
+
+- name: Keypair and the pod's copy of its public key
+  kubernetes.core.k8s_exec:
+    command: "{{ item }}"
+  loop:
+    - openstack keypair delete {{ verify_keypair }}
+    - rm -f {{ verify_pod_dir }}/rhoso-verify.pub
+  changed_when: false
+  failed_when: false
+
+- name: Nothing left
+  kubernetes.core.k8s_exec:
+    command: openstack project list -f json
+  register: vr_c_after
+  changed_when: false
+  failed_when: verify_project in (vr_c_after.stdout | from_json | map(attribute='Name'))

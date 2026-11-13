@@ -1,0 +1,127 @@
+---
+# Kept objects: external provider network + subnet (floating IPs), flavors, the CirrOS image (Glance on Cinder).
+- name: External network {{ verify_external_network }} (VLAN {{ vr_ext.vlan }} on physnet datacentre)
+  kubernetes.core.k8s_exec:
+    command: >-
+      openstack network create {{ verify_external_network }} --external
+      --provider-network-type vlan --provider-physical-network datacentre --provider-segment {{ vr_ext.vlan }}
+      --description "RHOSO external / floating IPs (rhoso-on-ocp-upi verify.yml)" -f json
+  register: vr_ext_create
+  changed_when: true
+  failed_when: vr_ext_create.rc | default(0) != 0
+  when: not vr_ext_exists
+
+- name: External subnet (current)
+  kubernetes.core.k8s_exec:
+    command: openstack subnet list --network {{ verify_external_network }} --name {{ verify_external_subnet }} -f json
+  register: vr_ext_sub
+  changed_when: false
+  failed_when: vr_ext_sub.rc | default(0) != 0
+
+- name: External subnet {{ verify_external_subnet }} (no DHCP, floating-IP pool)
+  vars:
+    base: "{{ vr_ext.cidr.split('/')[0].rsplit('.', 1)[0] }}"
+  kubernetes.core.k8s_exec:
+    command: >-
+      openstack subnet create {{ verify_external_subnet }} --network {{ verify_external_network }}
+      --subnet-range {{ vr_ext.cidr }} --gateway {{ vr.external.gateway }} --no-dhcp
+      --allocation-pool start={{ base }}.{{ vr.external.pool[0] }},end={{ base }}.{{ vr.external.pool[1] }} -f json
+  register: vr_ext_sub_create
+  changed_when: true
+  failed_when: vr_ext_sub_create.rc | default(0) != 0
+  when: vr_ext_sub.stdout | from_json | length == 0
+
+- name: Flavors (current)
+  kubernetes.core.k8s_exec:
+    command: openstack flavor list --all -f json
+  register: vr_flavors
+  changed_when: false
+  failed_when: vr_flavors.rc | default(0) != 0
+
+- name: Flavors
+  kubernetes.core.k8s_exec:
+    command: >-
+      openstack flavor create {{ item.name }} --vcpus {{ item.vcpus }} --ram {{ item.ram }} --disk {{ item.disk }} --public
+  loop: "{{ verify_flavors | rejectattr('name', 'in', vr_flavors.stdout | from_json | map(attribute='Name')) | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: vr_flavor_create
+  changed_when: true
+  failed_when: vr_flavor_create.rc | default(0) != 0
+
+- name: Image {{ verify_image.name }} (current)
+  kubernetes.core.k8s_exec:
+    command: openstack image list --name {{ verify_image.name }} -f json
+  register: vr_img
+  changed_when: false
+  failed_when: vr_img.rc | default(0) != 0
+
+- name: Upload the image
+  when: vr_img.stdout | from_json | length == 0
+  block:
+    - name: Download {{ verify_image.url | basename }} (pinned checksum)
+      ansible.builtin.get_url:
+        url: "{{ verify_image.url }}"
+        dest: "{{ vr_dir }}/{{ verify_image.url | basename }}"
+        checksum: "{{ verify_image.checksum }}"
+        mode: "0644"
+
+    - name: Into the openstackclient pod
+      kubernetes.core.k8s_cp:
+        namespace: "{{ rhoso_namespace }}"
+        pod: openstackclient
+        local_path: "{{ vr_dir }}/{{ verify_image.url | basename }}"
+        remote_path: "{{ verify_pod_dir }}/{{ verify_image.url | basename }}"
+        state: to_pod
+
+    - name: Image create (stored as a Cinder volume on the Pure back end)
+      kubernetes.core.k8s_exec:
+        command: >-
+          openstack image create {{ verify_image.name }} --file {{ verify_pod_dir }}/{{ verify_image.url | basename }}
+          --disk-format qcow2 --container-format bare --public -f json
+      register: vr_img_create
+      changed_when: true
+      failed_when: vr_img_create.rc | default(0) != 0
+  always:
+    - name: Remove the upload copy from the pod
+      kubernetes.core.k8s_exec:
+        command: rm -f {{ verify_pod_dir }}/{{ verify_image.url | basename }}
+      changed_when: false
+      failed_when: false
+
+- name: Image {{ verify_image.name }}
+  kubernetes.core.k8s_exec:
+    command: openstack image show {{ verify_image.name }} -f json
+  register: vr_img_show
+  changed_when: false
+  failed_when: vr_img_show.rc | default(0) != 0
+
+- name: Image's backing volume (Glance cinder store volume image-<id>, project service)
+  kubernetes.core.k8s_exec:
+    command: openstack volume list --all-projects --name image-{{ (vr_img_show.stdout | from_json).id }} -f json
+  register: vr_img_vols
+  changed_when: false
+  failed_when: vr_img_vols.rc | default(0) != 0
+
+- name: Backing volume details
+  kubernetes.core.k8s_exec:
+    command: openstack volume show {{ (vr_img_vols.stdout | from_json | first).ID }} -f json
+  register: vr_img_vol
+  changed_when: false
+  failed_when: false
+  when: vr_img_vols.stdout | from_json | length > 0
+
+- name: Checks
+  ansible.builtin.include_tasks: check.yml
+  loop:
+    - phase: base
+      name: image active
+      ok: "{{ (vr_img_show.stdout | from_json).status == 'active' }}"
+      detail: "{{ verify_image.name }} {{ (vr_img_show.stdout | from_json).status }}"
+    - phase: base
+      name: image stored on the Pure back end (Glance on Cinder)
+      ok: "{{ vr_img_vol.rc | default(1) == 0 and ((vr_img_vol.stdout | from_json)['os-vol-host-attr:host'] | default('')) is search('@pure') }}"
+      detail: "{{ ((vr_img_vol.stdout | from_json)['os-vol-host-attr:host'] | default('')) if vr_img_vol.rc | default(1) == 0 else 'no image-<id> volume' }}"
+  loop_control:
+    loop_var: chk
+    label: "{{ chk.name }}"

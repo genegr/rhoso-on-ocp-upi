@@ -1,0 +1,11 @@
+---
+- name: Write .state/<env>/verify-report.md
+  ansible.builtin.template:
+    src: verify-report.md.j2
+    dest: "{{ state_dir }}/verify-report.md"
+    mode: "0600"
+
+- name: Summary
+  ansible.builtin.debug:
+    msg: "{{ vr_checks | map(attribute='status') | zip(vr_checks | map(attribute='phase'), vr_checks | map(attribute='name'),
+             vr_checks | map(attribute='detail')) | map('join', ' | ') | list }}"

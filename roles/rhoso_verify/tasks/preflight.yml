@@ -1,0 +1,68 @@
+---
+# Read-only: compute hosts, existing objects. Runs in --check too.
+- name: Values
+  ansible.builtin.set_fact:
+    vr: "{{ e.rhoso.verify }}"
+    vr_ext: "{{ e.networks.external }}"
+    vr_dir: "{{ state_dir }}/verify"
+    vr_key: "{{ state_dir }}/verify/id_rsa"
+    vos: "openstack --os-project-name {{ verify_project }}"
+
+- name: The external network is configured (networks.external, rhoso.verify.external)
+  ansible.builtin.assert:
+    that:
+      - vr_ext.vlan is defined and vr_ext.cidr is defined
+      - vr.external.gateway is defined and vr.external.pool | length == 2
+      - vr_ext.cidr is match('^[0-9.]+\.0/24$') and verify_tenant_cidr is match('^[0-9.]+\.0/24$')
+      - vr.jumpbox_ip is match('^' ~ (vr_ext.cidr.split('/')[0].rsplit('.', 1)[0] | regex_escape) ~ '\.')
+    fail_msg: "networks.external (vlan, /24 cidr), rhoso.verify.external {gateway, pool: [first, last]} and
+      rhoso.verify.jumpbox_ip (inside networks.external) are required; verify_tenant_cidr must be a /24"
+    quiet: true
+
+- name: nova-compute services
+  kubernetes.core.k8s_exec:
+    command: openstack compute service list --service nova-compute -f json
+  register: vr_cs
+  changed_when: false
+  check_mode: false
+  failed_when: vr_cs.rc | default(0) != 0
+
+- name: Compute hosts (enabled and up)
+  ansible.builtin.set_fact:
+    vr_hosts: "{{ vr_cs.stdout | from_json | selectattr('Status', 'equalto', 'enabled')
+                  | selectattr('State', 'equalto', 'up') | map(attribute='Host') | sort }}"
+    vr_hosts_all: "{{ vr_cs.stdout | from_json | map(attribute='Host') | sort }}"
+
+- name: Networks
+  kubernetes.core.k8s_exec:
+    command: openstack network list -f json
+  register: vr_nets
+  changed_when: false
+  check_mode: false
+  failed_when: vr_nets.rc | default(0) != 0
+
+- name: Projects
+  kubernetes.core.k8s_exec:
+    command: openstack project list -f json
+  register: vr_projects
+  changed_when: false
+  check_mode: false
+  failed_when: vr_projects.rc | default(0) != 0
+
+- name: State
+  ansible.builtin.set_fact:
+    vr_ext_exists: "{{ verify_external_network in (vr_nets.stdout | from_json | map(attribute='Name')) }}"
+    vr_project_exists: "{{ verify_project in (vr_projects.stdout | from_json | map(attribute='Name')) }}"
+    vr_pool_ips: >-
+      {%- set base = vr_ext.cidr.split('/')[0].rsplit('.', 1)[0] -%}
+      {{ range(vr.external.pool[0] | int, vr.external.pool[1] | int + 1) | map('string') | map('regex_replace', '^', base ~ '.') | list }}
+
+- name: Plan
+  ansible.builtin.debug:
+    msg:
+      - "computes enabled+up: {{ vr_hosts | length }} of {{ vr_hosts_all | length }} (edpm_hosts: {{ e.edpm_hosts | length }})"
+      - "external network {{ verify_external_network }}: {{ 'exists' if vr_ext_exists else 'to create' }}
+         (vlan {{ vr_ext.vlan }} on datacentre, {{ vr_ext.cidr }}, gateway {{ vr.external.gateway }},
+         pool {{ vr_pool_ips | first }}-{{ vr_pool_ips | last }})"
+      - "project {{ verify_project }}: {{ 'EXISTS (left from a run with keep=true: run --tags cleanup first)' if vr_project_exists else 'to create, removed at the end' }}"
+      - "jump box test leg: {{ vr.jumpbox_ip }} on the {{ (e.jumpbox.test_nics | selectattr('network', 'equalto', 'external') | first).portgroup }} test vNIC"

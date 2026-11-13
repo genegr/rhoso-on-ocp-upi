@@ -1,0 +1,195 @@
+---
+# Project, tenant network + router on the external network, one CirrOS instance pinned to every compute with a floating
+# IP. Checks: placement, DHCP/metadata (the key reaches the instance), north-south SSH from the jump box's test leg,
+# east-west pings between all instances at the network's MTU.
+- name: A previous run's project must be gone (keep=true leaves it: run --tags cleanup)
+  ansible.builtin.assert:
+    that: not vr_project_exists
+    fail_msg: "project {{ verify_project }} exists: run playbooks/verify.yml -e env={{ env }} --tags cleanup first"
+    quiet: true
+
+- name: Project {{ verify_project }} with admin as member
+  kubernetes.core.k8s_exec:
+    command: "{{ item }}"
+  loop:
+    - openstack project create {{ verify_project }} --description "rhoso-on-ocp-upi verify.yml (temporary)"
+    - openstack role add --user admin --project {{ verify_project }} admin
+  register: vr_proj
+  changed_when: true
+  failed_when: vr_proj.rc | default(0) != 0
+
+- name: SSH key for the instances
+  community.crypto.openssh_keypair:
+    path: "{{ vr_key }}"
+    type: rsa
+    size: 3072
+    comment: rhoso-verify
+
+- name: Public key into the pod
+  kubernetes.core.k8s_cp:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    local_path: "{{ vr_key }}.pub"
+    remote_path: "{{ verify_pod_dir }}/rhoso-verify.pub"
+    state: to_pod
+
+- name: Keypair, security group, tenant network, router
+  kubernetes.core.k8s_exec:
+    command: "{{ item }}"
+  loop:
+    - openstack keypair delete {{ verify_keypair }}
+    - openstack keypair create {{ verify_keypair }} --public-key {{ verify_pod_dir }}/rhoso-verify.pub
+    - "{{ vos }} security group create {{ verify_prefix }}-sg"
+    - "{{ vos }} security group rule create {{ verify_prefix }}-sg --ingress --protocol icmp"
+    - "{{ vos }} security group rule create {{ verify_prefix }}-sg --ingress --protocol tcp --dst-port 22"
+    - "{{ vos }} network create {{ verify_prefix }}-net"
+    - "{{ vos }} subnet create {{ verify_prefix }}-subnet --network {{ verify_prefix }}-net --subnet-range {{ verify_tenant_cidr }}"
+    - "{{ vos }} router create {{ verify_prefix }}-router"
+    - "{{ vos }} router set {{ verify_prefix }}-router --external-gateway {{ verify_external_network }}"
+    - "{{ vos }} router add subnet {{ verify_prefix }}-router {{ verify_prefix }}-subnet"
+  loop_control:
+    label: "{{ item | regex_replace('^openstack (--os-project-name \\S+ )?', '') }}"
+  register: vr_netobj
+  changed_when: true
+  # deleting a keypair that doesn't exist is fine (first run)
+  failed_when: vr_netobj.rc | default(0) != 0 and item is not search('keypair delete')
+
+- name: Tenant network MTU
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} network show {{ verify_prefix }}-net -f json"
+  register: vr_net
+  changed_when: false
+  failed_when: vr_net.rc | default(0) != 0
+
+- name: One instance per compute (pinned with --availability-zone nova:<host>)
+  kubernetes.core.k8s_exec:
+    command: >-
+      {{ vos }} server create {{ verify_prefix }}-{{ item.split('.')[0] }} --flavor {{ verify_flavors[0].name }}
+      --image {{ verify_image.name }} --network {{ verify_prefix }}-net --security-group {{ verify_prefix }}-sg
+      --key-name {{ verify_keypair }} --availability-zone nova:{{ item }} --wait -f json
+  loop: "{{ vr_hosts }}"
+  register: vr_servers
+  changed_when: true
+  failed_when: false
+
+- name: Floating IPs
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} floating ip create {{ verify_external_network }} -f json"
+  loop: "{{ vr_servers.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: vr_fips
+  changed_when: true
+  failed_when: vr_fips.rc | default(0) != 0
+
+- name: Attach them
+  kubernetes.core.k8s_exec:
+    command: >-
+      {{ vos }} server add floating ip {{ (item.0.stdout | from_json).id }} {{ (item.1.stdout | from_json).floating_ip_address }}
+  loop: "{{ vr_servers.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list | zip(vr_fips.results) | list }}"
+  loop_control:
+    label: "{{ item.0.item }} {{ (item.1.stdout | from_json).floating_ip_address }}"
+  register: vr_fip_add
+  changed_when: true
+  failed_when: vr_fip_add.rc | default(0) != 0
+
+- name: Instance details
+  kubernetes.core.k8s_exec:
+    command: "{{ vos }} server show {{ verify_prefix }}-{{ item.split('.')[0] }} -f json"
+  loop: "{{ vr_hosts }}"
+  register: vr_show
+  changed_when: false
+  failed_when: false
+
+- name: Instances
+  ansible.builtin.set_fact:
+    vr_vms: >-
+      {%- set out = [] -%}
+      {%- for r in vr_show.results if r.rc | default(1) == 0 -%}
+      {%-   set s = r.stdout | from_json -%}
+      {%-   set addrs = s.addresses[verify_prefix ~ '-net'] | default([]) -%}
+      {%-   set fixed = addrs | select('match', (verify_tenant_cidr.split('/')[0].rsplit('.', 1)[0] | regex_escape) ~ '\\.') | list -%}
+      {%-   set fips = addrs | reject('in', fixed) | list -%}
+      {%-   set _ = out.append({'name': s.name, 'id': s.id, 'want': r.item, 'host': s['OS-EXT-SRV-ATTR:host'] | default(''),
+                                'status': s.status, 'fixed': fixed | first | default(''), 'fip': fips | first | default('')}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Wait for SSH on the floating IPs (from the jump box's test leg)
+  ansible.builtin.wait_for:
+    host: "{{ item.fip }}"
+    port: 22
+    timeout: 300
+    search_regex: SSH
+  loop: "{{ vr_vms | selectattr('fip') | list }}"
+  loop_control:
+    label: "{{ item.name }} {{ item.fip }}"
+  register: vr_ssh_port
+  ignore_errors: true                     # recorded as a FAIL check below; the run goes on
+
+- name: Instances as hosts (raw: CirrOS has no Python)
+  ansible.builtin.add_host:
+    name: "{{ item.name }}"
+    groups: [verify_vms]
+    ansible_host: "{{ item.fip }}"
+    ansible_user: "{{ verify_image.user }}"
+    ansible_ssh_private_key_file: "{{ vr_key }}"
+    ansible_python_interpreter: /bin/false
+  loop: "{{ vr_vms | selectattr('fip') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+- name: Inside each instance (key from metadata, address from DHCP, MTU)
+  ansible.builtin.raw: ip -4 -o addr show dev eth0; cat /sys/class/net/eth0/mtu
+  delegate_to: "{{ item.name }}"
+  loop: "{{ vr_vms | selectattr('fip') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: vr_inside
+  changed_when: false
+  failed_when: false
+
+- name: East-west from the first instance to every other one ({{ (vr_net.stdout | from_json).mtu }} MTU)
+  ansible.builtin.raw: ping -c 3 -W 2 -s {{ (vr_net.stdout | from_json).mtu | int - 28 }} {{ item.fixed }}
+  delegate_to: "{{ vr_vms[0].name }}"
+  loop: "{{ vr_vms[1:] }}"
+  loop_control:
+    label: "{{ vr_vms[0].name }} -> {{ item.name }} {{ item.fixed }}"
+  register: vr_ew
+  changed_when: false
+  failed_when: false
+  when: vr_vms | length > 1 and vr_vms[0].fip
+
+- name: Checks
+  ansible.builtin.include_tasks: check.yml
+  loop: >-
+    {%- set out = [{'phase': 'smoke', 'name': 'computes enabled and up', 'ok': vr_hosts | length == e.edpm_hosts | length,
+                    'detail': (vr_hosts | length) ~ ' of ' ~ (e.edpm_hosts | length) ~ ' edpm_hosts'}] -%}
+    {%- for r in vr_servers.results -%}
+    {%-   set v = vr_vms | selectattr('want', 'equalto', r.item) | first | default({}) -%}
+    {%-   set _ = out.append({'phase': 'smoke', 'name': 'instance on ' ~ r.item.split('.')[0],
+            'ok': v.status | default('') == 'ACTIVE' and v.host | default('') == r.item,
+            'detail': (v.status | default('') ~ ' on ' ~ v.host | default('')) if v else (r.stderr | default(r.msg | default('')) | trim | truncate(200))}) -%}
+    {%- endfor -%}
+    {%- for r in vr_ssh_port.results | default([]) -%}
+    {%-   set _ = out.append({'phase': 'smoke', 'name': 'north-south: SSH to ' ~ r.item.name ~ ' floating IP',
+            'ok': r.failed is not defined or not r.failed, 'detail': r.item.fip ~ (' ' ~ r.msg if r.msg is defined else '')}) -%}
+    {%- endfor -%}
+    {%- for r in vr_inside.results | default([]) -%}
+    {%-   set lines = (r.stdout | default('')).splitlines() -%}
+    {%-   set _ = out.append({'phase': 'smoke', 'name': 'login with the metadata key, DHCP address, MTU: ' ~ r.item.name,
+            'ok': r.rc | default(1) == 0 and r.item.fixed in r.stdout | default('')
+                  and (lines | last | default('') | trim) == ((vr_net.stdout | from_json).mtu | string),
+            'detail': 'mtu ' ~ (lines | last | default('?') | trim) ~ ', ' ~ r.item.fixed}) -%}
+    {%- endfor -%}
+    {%- for r in vr_ew.results | default([]) if r.skipped is not defined -%}
+    {%-   set _ = out.append({'phase': 'smoke', 'name': 'east-west: ' ~ vr_vms[0].name ~ ' -> ' ~ r.item.name,
+            'ok': r.rc | default(1) == 0, 'detail': (r.stdout | default('') | regex_search('\\d+% packet loss') | default('', true))}) -%}
+    {%- endfor -%}
+    {%- set _ = out.append({'phase': 'smoke', 'name': 'tenant network MTU', 'ok': none,
+          'detail': 'geneve network MTU ' ~ (vr_net.stdout | from_json).mtu ~ ' (Neutron global_physnet_mtu decides it; the tenant VLAN runs 9000)'}) -%}
+    {{ out }}
+  loop_control:
+    loop_var: chk
+    label: "{{ chk.name }}"

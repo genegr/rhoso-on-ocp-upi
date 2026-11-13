@@ -14,7 +14,9 @@ nodes. Ansible drives every step from that repo's pinned toolbox container on th
   `dnf distro-sync` in `edpm_prep.yml` (no module does it; previewed with `--assumeno`, run only when the preview
   has a transaction and `-e distro_sync=true`);
   `tcpdump` in `lldp.yml` (receive-only capture of the switches' LLDP/CDP frames; no module reads them);
-  `oc`/`openstack` CLIs only where no module exists.
+  `multipath -ll` and `iscsiadm -m session` on a compute in `verify.yml` (read-only; no module reports them);
+  `raw` on the CirrOS test instances in `verify.yml` (no Python in the guest);
+  `oc`/`openstack` CLIs only where no module exists (`openstack` through `k8s_exec` in pod `openstackclient`).
   `plugins/modules/vmware_dvpg_security.py` exists because `community.vmware.vmware_dvs_portgroup` rebuilds the whole
   port group config (teaming, failure criteria, inherited flags) on every update: it sets only the security policy of
   an existing distributed port group.
@@ -43,8 +45,9 @@ jumpbox/                                cloud-init user-data template + runbook 
 envs/                                   <env>.yaml, vault.yml (gitignored), examples
 docs/                                   network-requirements.md (doc-sourced checklist), design.md
 playbooks/, roles/                      discover, netcheck, edpm_*, then the RHOSO phases (rhoso.yml: tags
-                                        operators, networks, flasharray, controlplane, dataplane)
+                                        operators, networks, flasharray, controlplane, dataplane), verify.yml
 plugins/modules/                        vmware_dvpg_security
-.claude/skills/                         rhoso-* skills: jumpbox, discover, netcheck, edpm-prep, deploy, dataplane, status
+.claude/skills/                         rhoso-* skills: jumpbox, discover, netcheck, edpm-prep, deploy, dataplane,
+                                        verify, status
 .state/                                 ssh keys, rendered user-data, reports, logs
 ```

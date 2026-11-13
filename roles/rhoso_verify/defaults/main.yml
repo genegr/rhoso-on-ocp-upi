@@ -1,0 +1,24 @@
+---
+# Functional verification of the cloud (README phase 6). Objects named here are created by playbooks/verify.yml.
+# Kept afterwards (Tempest uses them): the external network, its subnet, the flavors and the image.
+verify_external_network: public
+verify_external_subnet: public-subnet
+verify_flavors:
+  - {name: m1.tiny, vcpus: 1, ram: 512, disk: 1}
+  - {name: m1.small, vcpus: 1, ram: 2048, disk: 20}
+# CirrOS: small, no Python (instance checks use the raw module). Pinned with the checksum from its SHA256SUMS.
+verify_image:
+  name: cirros-0.6.3
+  url: https://download.cirros-cloud.net/0.6.3/cirros-0.6.3-x86_64-disk.img
+  checksum: sha256:7d6355852aeb6dbcd191bcda7cd74f1536cfe5cbf8a10495a7283a8396e4b75b
+  user: cirros
+
+# Removed at the end of every run (unless -e keep=true): the project and everything in it, and the keypair.
+verify_project: rhoso-verify
+verify_prefix: verify
+verify_keypair: rhoso-verify
+verify_tenant_cidr: 192.168.199.0/24     # project network inside geneve; never leaves the cloud
+verify_volume_gb: 1
+verify_marker: rhoso-verify-marker
+
+verify_pod_dir: /home/cloud-admin        # openstackclient pod, home of the CLI user
