@@ -34,9 +34,10 @@ Report in plain words: usable or not, then only what's wrong and what it means.
 ## Reading the results
 - A compute missing from `compute service list` but its deployment Ready: cell mapping not done, rerun the
   `dataplane` phase (it runs `discover_hosts`) or check `nova-cell0-conductor-0` logs.
-- A compute `down`: SSH to its **ctlplane** address from the rhoso toolbox (`ssh -i .state/ssh/id_ed25519
-  root@<ctlplane ip>`; sshd only allows `rhoso.dataplane.sshd_allowed_ranges`, so the management IP may not answer)
-  and check `systemctl list-units 'edpm_*'` (nova_compute, ovn_controller containers), time sync, the ctlplane VLAN.
+- A compute `down`: SSH to its **management** address (`edpm_hosts[].ip`) from the rhoso toolbox
+  (`ssh -i .state/ssh/id_ed25519 root@<ip>`). The jump box has no leg on the ctlplane VLAN, so the ctlplane address
+  only answers from the cluster. Check `systemctl list-units 'edpm_*'` (nova_compute, ovn_controller containers),
+  `ovs-vsctl get open . external_ids:ovn-bridge-mappings`, time sync, and the VLAN ports on `br-ex`.
 - `cinder-volume` down: the `cinder-volume-pure-secret` token (`flasharray` phase), the storage network NAD, and the
   array portals from the pod's node.
 - Control plane not Ready: `rhoso-deploy` skill, "Not Ready".
