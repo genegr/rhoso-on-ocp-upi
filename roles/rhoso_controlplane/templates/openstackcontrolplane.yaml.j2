@@ -228,12 +228,16 @@ spec:
     template:
       ovnController:
         networkAttachment: tenant
-        nicMappings:
-          datacentre: {{ cp_ovn_nic }}
         # Gateways (router external ports, SNAT) only on the computes (edpm_enable_chassis_gw; design N9). The OCP
         # nodes' datacentre NIC is an access port group (the external VLAN arrives untagged) while the external
         # network is a tagged VLAN: a gateway failing over to a master would break floating IPs (verify.yml's
-        # gateway report showed masters in the priority list, 2026-11-13).
+        # gateway report showed masters in the priority list, 2026-11-13). Neutron only schedules gateways on
+        # chassis with a bridge mapping for the external physnet, so the OCP nodes get no datacentre mapping; the
+        # flag alone is not enough (the operator never pushed a change of it to running nodes).
+{% if cp.ocp_nodes_gateway | default(false) | bool %}
+        nicMappings:
+          datacentre: {{ cp_ovn_nic }}
+{% endif %}
         external-ids:
           enable-chassis-as-gateway: {{ cp.ocp_nodes_gateway | default(false) | bool | lower }}
       ovnDBCluster:

@@ -27,6 +27,7 @@
     local_path: "{{ state_dir }}/tenants/{{ t.name }}-clouds.yaml"
     remote_path: "{{ tenant_pod_dir }}/tenant-{{ t.name }}-clouds.yaml"
     state: to_pod
+  changed_when: false                   # a temporary working file, removed at the end of the play
 
 - name: CLI as {{ tn_user }}
   ansible.builtin.set_fact:

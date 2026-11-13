@@ -126,6 +126,49 @@
   delay: 30
   when: not ansible_check_mode
 
+# Gateway candidates = chassis with enable-chassis-as-gw AND a bridge mapping for the external physnet (datacentre).
+# The OCP nodes must not be candidates: the template has no nicMappings and the flag false. The k8s module merges
+# into the live OpenStackControlPlane, so a removed nicMappings stays there: remove it with a JSON patch. The operator
+# then rolls ovn-controller(-ovs), whose start scripts drop the bridge mapping. (A rollout restart of its DaemonSets
+# by hand is reverted by the operator, and the flag alone never reached running nodes.)
+- name: Live OpenStackControlPlane (ovnController)
+  kubernetes.core.k8s_info:
+    api_version: core.openstack.org/v1beta1
+    kind: OpenStackControlPlane
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ rhoso_controlplane_name }}"
+  register: cp_live
+  when: not ansible_check_mode
+
+- name: Remove nicMappings from the OCP nodes' ovn-controller
+  kubernetes.core.k8s_json_patch:
+    api_version: core.openstack.org/v1beta1
+    kind: OpenStackControlPlane
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ rhoso_controlplane_name }}"
+    patch:
+      - op: remove
+        path: /spec/ovn/template/ovnController/nicMappings
+  when:
+    - not ansible_check_mode
+    - not (cp.ocp_nodes_gateway | default(false) | bool)
+    - cp_live.resources[0].spec.ovn.template.ovnController.nicMappings | default({}) | length > 0
+
+- name: No OCP node is a gateway candidate (OVN SB, after the operator's rollout)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: ovsdbserver-sb-0
+    container: ovsdbserver-sb
+    command: ovn-sbctl --no-leader-only --format=csv --data=bare --no-headings --columns=hostname,other_config list Chassis
+  register: cp_chassis_after
+  until: >-
+    cp_chassis_after.stdout_lines | select('search', 'enable-chassis-as-gw') | select('search', 'ovn-bridge-mappings=[^ ]*datacentre')
+    | map('regex_replace', ',.*$', '') | select('in', rn_nodes | map(attribute='hostname') | list) | list | length == 0
+  retries: 60
+  delay: 10
+  changed_when: false
+  when: not ansible_check_mode and not (cp.ocp_nodes_gateway | default(false) | bool)
+
 # Volume type for the Pure back end, Cinder's default_volume_type (customServiceConfig in the template). The toolbox has
 # no OpenStack SDK: the CLI runs in the openstackclient pod, as the docs do. Read first, create only when missing.
 - name: Volume type {{ cinder_volume_type }} (current)

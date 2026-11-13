@@ -93,24 +93,47 @@
       delegate_to: tcheck-{{ t.name }}
       loop:
         - cat /sys/class/net/eth0/mtu
-        - nslookup api.{{ e.domain }}
-        - nslookup registry.redhat.io
+        - nslookup -type=a api.{{ e.domain }}
+        - nslookup -type=a registry.redhat.io
         - ping -c 3 -W 2 1.1.1.1
       register: tc_inside
       changed_when: false
       failed_when: false
 
-    - name: "{{ t.name }}: volume, attached"
+    - name: "{{ t.name }}: volume"
       kubernetes.core.k8s_exec:
-        command: "{{ item }}"
-      loop:
-        - "{{ tn_os }} volume create tcheck-{{ t.name }} --size 1 -f json"
-        - "sleep 15"
-        - "{{ tn_os }} server add volume tcheck-{{ t.name }} tcheck-{{ t.name }}"
-        - "sleep 15"
-        - "{{ tn_os }} volume show tcheck-{{ t.name }} -f value -c status"
-      register: tc_vol
+        command: "{{ tn_os }} volume create tcheck-{{ t.name }} --size 1 -f json"
+      register: tc_vol_new
       changed_when: true
+      failed_when: false
+
+    - name: "{{ t.name }}: volume available"
+      kubernetes.core.k8s_exec:
+        command: "{{ tn_os }} volume show tcheck-{{ t.name }} -f value -c status"
+      register: tc_vol_avail
+      until: tc_vol_avail.stdout | default('') | trim in ['available', 'error']
+      retries: 30
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ t.name }}: attach it"
+      kubernetes.core.k8s_exec:
+        command: "{{ tn_os }} server add volume tcheck-{{ t.name }} tcheck-{{ t.name }}"
+      register: tc_vol_attach
+      changed_when: true
+      failed_when: false
+      when: tc_vol_avail.stdout | default('') | trim == 'available'
+
+    - name: "{{ t.name }}: volume in-use"
+      kubernetes.core.k8s_exec:
+        command: "{{ tn_os }} volume show tcheck-{{ t.name }} -f value -c status"
+      register: tc_vol_state
+      until: tc_vol_state.stdout | default('') | trim in ['in-use', 'error', 'error_attaching', 'available']
+             and not (tc_vol_state.stdout | default('') | trim == 'available' and tc_vol_state.attempts | default(1) < 12)
+      retries: 30
+      delay: 5
+      changed_when: false
       failed_when: false
 
 - name: "{{ t.name }}: results"
@@ -141,8 +164,8 @@
       {%-     endfor -%}
       {%-     set _ = out.append(('PASS' if r[3].rc | default(1) == 0 else 'FAIL') ~ ' internet from the instance: '
                                  ~ (r[3].stdout | default('') | regex_search('[0-9]+% packet loss') | default('no reply', true))) -%}
-      {%-     set _ = out.append(('PASS' if (tc_vol.results[4].stdout | default('') | trim) == 'in-use' else 'FAIL') ~ ' volume attached: '
-                                 ~ (tc_vol.results[4].stdout | default('?') | trim)) -%}
+      {%-     set _ = out.append(('PASS' if (tc_vol_state.stdout | default('') | trim) == 'in-use' else 'FAIL') ~ ' volume attached: '
+                                 ~ (tc_vol_state.stdout | default('?') | trim) ~ ((' ' ~ (tc_vol_attach.stderr | default('') | trim | truncate(120))) if tc_vol_attach.rc | default(0) != 0 else '')) -%}
       {%-   endif -%}
       {%- endif -%}
       {{ out }}
@@ -151,12 +174,26 @@
   ansible.builtin.debug:
     var: tc_results
 
-- name: "{{ t.name }}: clean up the check objects"
+- name: "{{ t.name }}: clean up - the instance"
+  kubernetes.core.k8s_exec:
+    command: "{{ tn_os }} server delete --wait tcheck-{{ t.name }}"
+  changed_when: true
+  failed_when: false
+
+- name: "{{ t.name }}: clean up - the volume, once detached"
+  kubernetes.core.k8s_exec:
+    command: "{{ tn_os }} volume show tcheck-{{ t.name }} -f value -c status"
+  register: tc_vol_gone
+  until: tc_vol_gone.rc | default(0) != 0 or tc_vol_gone.stdout | default('') | trim not in ['in-use', 'detaching']
+  retries: 24
+  delay: 5
+  changed_when: false
+  failed_when: false
+
+- name: "{{ t.name }}: clean up - volume, floating IP, keypair"
   kubernetes.core.k8s_exec:
     command: "{{ item }}"
   loop:
-    - "{{ tn_os }} server delete --wait tcheck-{{ t.name }}"
-    - "sleep 10"
     - "{{ tn_os }} volume delete tcheck-{{ t.name }}"
     - "{{ tn_os }} floating ip delete {{ (tc_fip.stdout | from_json).floating_ip_address if tc_fip is defined and tc_fip is not skipped else 'none' }}"
     - "{{ tn_os }} keypair delete tcheck"

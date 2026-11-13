@@ -218,10 +218,13 @@
 # The subnet has no dns_nameservers: OVN DHCP hands out Neutron's [ovn] dns_servers (the lab DNS); the router
 # masquerades the queries. A lab name and an internet name must both resolve.
 - name: DNS inside the first instance
-  ansible.builtin.raw: nslookup {{ item }}
+  ansible.builtin.raw: nslookup -type=a {{ item }}     # A only: busybox prints "No answer" for a missing AAAA
   delegate_to: "{{ vr_vms[0].name }}"
   loop: "{{ ['api.' ~ e.domain, 'registry.redhat.io'] }}"     # a lab name (the cluster's AD zone) and an internet name
   register: vr_dns
+  until: vr_dns.stdout | default("") is search("Name:|canonical name")
+  retries: 3
+  delay: 5
   changed_when: false
   failed_when: false
   when: vr_vms | length > 0 and vr_vms[0].fip | length > 0
