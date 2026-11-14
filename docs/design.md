@@ -42,9 +42,10 @@ image tag (matching the RHOSO release, S1), the images and the toolbox.
 
 ## 2. OpenShift underneath
 
-- **Compact cluster on VMs.** The three masters are schedulable and run the whole control plane. Red Hat states
-  the minimum as a "3-node bare metal" cluster (V3). Running it on vSphere VMs is the one choice that needs support
-  confirmation. It's listed under open items.
+- **Compact cluster on VMs.** The three masters are schedulable and run the whole control plane. Red Hat states the
+  minimum as a "3-node bare metal" cluster (V3). Running it on vSphere VMs is accepted for this proof of concept,
+  whose scope is the FlashArray's performance with OpenStack, not control-plane behaviour under load. Section 11
+  gives the path to bare metal.
 - **NICs per master.** One NIC on the machine network for OpenShift, then one vNIC per RHOSO network: ctlplane,
   internalapi, tenant, external, and iSCSI A and B (N2). Each sits on its own port group. Interface names are
   matched by MAC, from the OCP cluster model, against each node's `NodeNetworkState`. They're also recorded in
@@ -240,11 +241,19 @@ image tag (matching the RHOSO release, S1), the images and the toolbox.
 | 2026-11-14 | Glance image volumes multiattach, `service` quota unlimited | defaults | Concurrent boots of one image; more than 10 images |
 | 2026-11-14 | Image signature verification not enforced in Nova | enforced | No signing workflow in the lab; Tempest is told so |
 | 2026-11-14 | Standard admin and tenant passwords from the vault | generated passwords | Lab convenience; the admin password goes through the Keystone API |
+| 2026-11-14 | Control plane on the compact cluster's VMs | bare-metal OCP nodes | Proof of concept of FlashArray performance; control plane under load out of scope (V3) |
 
 ## 11. Open items and limits
 
-- **V3**: the control plane on vSphere VMs, where Red Hat documents bare metal. This needs support confirmation
-  before any production use, and the `[recheck]` rows of network-requirements.md need a browser check.
+- **V3: the control plane runs on vSphere VMs, where Red Hat documents bare metal.** This is a known and accepted
+  limit of the proof of concept. Under heavy provisioning (many instances or volumes created at once) the API
+  services may respond more slowly than on bare metal. That's out of scope: the proof of concept measures the
+  FlashArray data path, and Tempest doesn't test it. If such load tests become in scope, the control plane moves to
+  bare metal: new bare-metal OCP workers join the cluster, and the control plane is pinned to them
+  (`OpenStackControlPlane` `nodeSelector`; NNCPs, NADs and MetalLB on the new nodes' NICs). Galera, RabbitMQ and the
+  OVN databases run 3 replicas each with quorum. On 2 workers one node holds 2 of the 3, and losing that node loses
+  quorum. A third worker, or keeping a master in the selection, avoids that.
+- The `[recheck]` rows of network-requirements.md still need a browser check against the Red Hat docs.
 - **No live migration between CPU vendors.** Cold migration only.
 - **Not deployed:** Octavia (load balancers), Designate, Heat, Manila, Swift, telemetry. Adding one means enabling it
   in the template, after which Tempest picks up its plugin.

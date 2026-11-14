@@ -18,7 +18,7 @@ Sources (base `https://docs.redhat.com/en/documentation/red_hat_openstack_servic
 |---|---|---|---|---|
 | V1 | RHOSO FR6 (18.0.21; 18.0.22 is a later bug-fix release on FR6) supports OCP 4.18 and 4.20. Greenfield: latest OCP in the table only, so **4.20** | LC, KCS 7125383 | cluster config pins 4.20.z | OCP 4.20 |
 | V2 | Data-plane nodes: RHEL 9.4 or 9.6. Release locked, EUS repos (baseos/appstream/highavailability EUS, fast-datapath, rhoso-18.0) | LC; certified-hypervisors article; DEP node set example **[recheck]** | discover: OS version, subscription | 9.6, subscribed with EUS |
-| V3 | Control plane on a compact or 3+3 OCP cluster; the stated minimum is a "3-node **bare metal**" cluster | PYD ch. 3 **[recheck]** | n/a | **Support confirmation needed for vSphere VMs** |
+| V3 | Control plane on a compact or 3+3 OCP cluster; the stated minimum is a "3-node **bare metal**" cluster | PYD ch. 3 **[recheck]** | n/a | vSphere VMs: accepted for the proof of concept (design.md §11) |
 | V4 | Per node in a compact cluster: ≥16 cores, ≥64 GB RAM, 120 GB SSD root + 250 GB, on top of OCP control-plane needs; a 150 GB PV pool; a default RWO StorageClass | PYD ch. 3 **[recheck]** | discover: ESXi CPU/RAM/datastore free | capacity for 3 × (≥16 vCPU, ≥64 GB) + bootstrap + jump box |
 | V5 | Operators: NMState, MetalLB, cert-manager; OVN-K `gatewayConfig.ipForwarding: Global` | PYD ch. 3, DEP ch. 3 **[recheck]** | after OCP install | — |
 
