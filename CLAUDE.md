@@ -39,6 +39,41 @@ nodes. Ansible drives every step from that repo's pinned toolbox container on th
 - Changes to shared infrastructure (vSphere port groups, AD DNS, bare-metal host networking, the FlashArray):
   `--check --diff` first and the user's explicit go-ahead before a real run.
 - `netcheck.yml` creates only `rhoso-test-*` interfaces and never touches existing connections.
+- **`k8s_exec` ignores check mode**: under `--check` it runs the command for real (found 2026-11-14: a controlplane
+  `--check` created a volume type and retyped volumes). Every changing `k8s_exec` task needs
+  `when: not ansible_check_mode`, or its playbook refuses `--check` (`verify.yml` ends the play, `tenant.yml` asserts).
+- **A "changed" with no spec change** (generation unchanged, the diff only moves our `managedFields` entry) means the
+  operator puts back at admission something the template leaves out: we rewrite it, it restores it, every run. Found
+  with `dns.template.options` (`local /openstack.svc/`). Compare the rendered CR with the live one and add the field.
+- Computes with different CPUs: Nova's default `host-model` breaks live migration between them ("guest CPU doesn't
+  match specification: missing features"). `rhoso.dataplane.cpu_groups` = one node set per CPU group, each with its
+  own Nova service and `cpu_models` (pick with `virsh hypervisor-cpu-compare` inside `nova_compute`).
+
+## Short and spoken prompts
+Prompts are often dictated (`/voice`): short, with no flags or file names, and with words misheard.
+- **Map the words**:
+  - "rose so", "row so", "R H O S O", "Red Hat OpenStack", "OpenStack", "the cloud" → this repo.
+  - "O C P", "open shift", "the cluster" → `../ocp-upi-baremetal-vms` (its own CLAUDE.md and skills; read them from
+    there when they aren't loaded).
+  - "E D P M", "the computes", "compute nodes", "bare-metal hosts" → the data plane.
+  - "temp est" → Tempest.
+  - "vi OS", "vios" → the VyOS router.
+  - "jump box" → `SYNC_HOST`.
+- **Entry points**:
+  - "deploy / rebuild / continue the lab" (OpenShift + OpenStack, or either), "what's next", "where are we" →
+    skill `rhoso-lab`.
+  - "is it up?" → `rhoso-status`, which also covers OpenShift.
+  - "does it work?" → `rhoso-verify`.
+  - "run tempest" → `rhoso-tempest`.
+  - "add a user / project / image" → `rhoso-tenant`.
+- **Target**: with one non-example `envs/*.yaml`, use it and its `ocp_cluster`, and say both back in the first line.
+  With several, ask.
+- **Gates stay gates**: a dictated "deploy it" covers the steps, never consent. Shared infrastructure (above),
+  `rhoso_teardown.yml`, OCP `destroy.yml` and storage teardown still need a yes in a reply to the shown plan. Treat
+  "clean up", "reset", "wipe", "redo" and "start over" as possibly destructive: say what would be deleted and ask.
+  Ask too when a name, a host or a number reads garbled.
+- **Replies**: first a one-line plan (the steps, the time, where it will stop for a yes). Then a line per finished
+  step. At the end a few plain sentences, without tables.
 
 ## Layout
 ```
@@ -48,9 +83,12 @@ envs/                                   <env>.yaml, vault.yml (gitignored), exam
 docs/                                   network-requirements.md (doc-sourced checklist), design.md
 playbooks/, roles/                      discover, netcheck, edpm_*, then the RHOSO phases (rhoso.yml: tags
                                         operators, networks, flasharray, controlplane, dataplane), verify.yml,
-                                        router.yml (VyOS, OVA from ../vyos-vsphere-image), rhoso_teardown.yml
+                                        router.yml (VyOS, OVA from ../vyos-vsphere-image), images.yml, tenant.yml,
+                                        tempest.yml, rhoso_teardown.yml
 plugins/modules/                        vmware_dvpg_security
-.claude/skills/                         rhoso-* skills: jumpbox, discover, netcheck, edpm-prep, deploy, dataplane,
-                                        verify, status
+.claude/skills/                         rhoso-* skills: lab (end-to-end runbook, the entry point), jumpbox,
+                                        discover, netcheck, edpm-prep, deploy, dataplane, router, verify, tenant,
+                                        tempest, status, teardown
+                                        (OCP skills load with: claude --add-dir ../ocp-upi-baremetal-vms)
 .state/                                 ssh keys, rendered user-data, reports, logs
 ```
