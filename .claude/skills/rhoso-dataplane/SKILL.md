@@ -24,7 +24,13 @@ real run on one host with `dataplane_limit`, with the user's go-ahead. Runs take
 2. ConfigMaps `edpm-multipath` (`multipath.conf.j2`, mounted for `edpm_multipathd`) and `nova-extra-config`
    (`volume_use_multipath = True`, picked up by the default nova service). Custom service `pure-storage-udev` (the Pure
    udev rules the OCP nodes use).
-3. Node set `rhoso.dataplane.nodeset`, rendered to `.state/<env>/dataplane/nodeset.yaml`: management address and
+3. Node set `rhoso.dataplane.nodeset`, or with `rhoso.dataplane.cpu_groups` one node set per CPU group (hosts by
+   model; ConfigMap `nova-cpu-<node set>` with `cpu_mode = custom` + `cpu_models`, service `nova-<node set>` = the
+   live `nova` service plus that ConfigMap). Existing node sets are applied first: a host moving out is removed by JSON
+   patch (merge apply keeps map keys), and the new node set waits for the host's IPSet to be released. Under `--check`
+   a new node set whose hosts are still elsewhere is only announced (the webhook would say "already exists in another
+   cluster"). The deployment covers all node sets (`ssh-known-hosts` runs across them, keeping cold migration between
+   groups). Each node set is rendered to `.state/<env>/dataplane/nodeset-<name>.yaml`: management address and
    default route on `br-ex` over `bond0` (members from `rhoso.dataplane.models[<model>].bond_nics`), ctlplane/
    internalapi/tenant as VLANs on `br-ex`, `storage`/`storage2` on the host's `iscsi_nics`, fixed IPs =
    `<subnet>.<host number>`, `edpm_enable_chassis_gw` (floating IPs through the computes).
@@ -34,7 +40,11 @@ real run on one host with `dataplane_limit`, with the user's go-ahead. Runs take
 ## Rules and gotchas
 - A deployment is one-shot: a finished one (Ready or failed) is left as it is. To run again, pass
   `-e dataplane_run=<suffix>` for a new name. `-e dataplane_deploy=false` applies only the node set, to review the
-  generated inventory.
+  generated inventory. After a Nova config change, run only the Nova service, one node set per deployment
+  (`servicesOverride` applies to every node set of a deployment):
+  `-e dataplane_run=<suffix>-<node set> -e dataplane_nodesets=<node set> -e dataplane_services=nova-<node set>`.
+- CPU groups set `skip_cpu_compare_on_dest = false` (RHOSO's 01-nova.conf sets it true for host-model, nova bug
+  2039803): the destination pre-check then refuses a host of the other group and the conductor tries the next one.
 - The operator webhook refuses any node-set patch while one of its deployments runs: the play then skips the node set
   and says so. Wait, then rerun.
 - `Ready`/`InputReady` read Error for a while when cert-manager is still issuing per-node TLS certs; only

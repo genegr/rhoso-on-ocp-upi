@@ -1,0 +1,74 @@
+---
+# One OpenStackDataPlaneNodeSet (loop_var ns: name, hosts, nova service), from main.yml.
+- name: "{{ ns.name }}: rendered (kept in .state for review; no secrets in it)"
+  ansible.builtin.template:
+    src: nodeset.yaml.j2
+    dest: "{{ dp_dir }}/nodeset-{{ ns.name }}.yaml"
+    mode: "0600"
+  check_mode: false
+  changed_when: false
+
+# A host moving here from another node set: its IPSet (named after the host) must be released first, or the
+# operator can't reserve the host's fixed IPs for this node set.
+- name: "{{ ns.name }}: IPSets of its hosts free or already its own"
+  kubernetes.core.k8s_info:
+    api_version: network.openstack.org/v1beta1
+    kind: IPSet
+    namespace: "{{ rhoso_namespace }}"
+  register: ns_ipsets
+  until: >-
+    ns_ipsets.resources
+    | selectattr('metadata.name', 'in', ns.hosts | map(attribute='name') | list)
+    | rejectattr('metadata.ownerReferences', 'undefined')
+    | map(attribute='metadata.ownerReferences') | flatten | map(attribute='name')
+    | reject('equalto', ns.name) | list | length == 0
+  retries: 30
+  delay: 10
+  when: dp_running | length == 0 and not ansible_check_mode
+
+# The k8s module merges maps: a host taken out of spec.nodes (moved to another node set) needs an explicit remove.
+- name: "{{ ns.name }}: hosts no longer in it removed"
+  kubernetes.core.k8s_json_patch:
+    api_version: dataplane.openstack.org/v1beta1
+    kind: OpenStackDataPlaneNodeSet
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ ns.name }}"
+    patch: "{{ ns_gone | map('regex_replace', '^(.*)$', '{\"op\": \"remove\", \"path\": \"/spec/nodes/\\1\"}') | map('from_json') | list }}"
+  vars:
+    ns_live: "{{ dp_ns_existing.resources | selectattr('metadata.name', 'equalto', ns.name) | list }}"
+    ns_gone: "{{ (ns_live[0].spec.nodes.keys() | list if ns_live else []) | difference(ns.hosts | map(attribute='name') | list) }}"
+  when: dp_running | length == 0 and ns_gone | length > 0
+
+# Under --check the hosts moving here are still in their old node set (the removal above is only simulated), and the
+# webhook refuses a node set with a host "already exists in another cluster".
+- name: "{{ ns.name }}: OpenStackDataPlaneNodeSet"
+  kubernetes.core.k8s:
+    src: "{{ dp_dir }}/nodeset-{{ ns.name }}.yaml"
+  when: dp_running | length == 0 and not (ansible_check_mode and ns_taken | length > 0)
+  vars:
+    ns_taken: >-
+      {{ dp_ns_existing.resources | rejectattr('metadata.name', 'equalto', ns.name)
+         | map(attribute='spec.nodes') | map('list') | flatten | intersect(ns.hosts | map(attribute='name') | list) }}
+
+- name: "{{ ns.name }}: not checked (its hosts move here from another node set in the real run)"
+  ansible.builtin.debug:
+    msg: "would be applied after the other node set releases {{ ns_taken | join(', ') }}"
+  when: ansible_check_mode and ns_taken | length > 0
+  vars:
+    ns_taken: >-
+      {{ dp_ns_existing.resources | rejectattr('metadata.name', 'equalto', ns.name)
+         | map(attribute='spec.nodes') | map('list') | flatten | intersect(ns.hosts | map(attribute='name') | list) }}
+
+- name: "{{ ns.name }}: ready for deployment (SetupReady)"
+  kubernetes.core.k8s_info:
+    api_version: dataplane.openstack.org/v1beta1
+    kind: OpenStackDataPlaneNodeSet
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ ns.name }}"
+  register: ns_state
+  until: >-
+    (ns_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'SetupReady')
+     | map(attribute='status') | first | default('')) == 'True'
+  retries: 30
+  delay: 10
+  when: not ansible_check_mode

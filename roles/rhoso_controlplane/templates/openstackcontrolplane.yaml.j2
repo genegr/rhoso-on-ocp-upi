@@ -83,9 +83,13 @@ spec:
   dns:
     template:
       replicas: 2
+      # local: the operator's defaulting puts it back at admission when it's missing; leaving it out made every apply
+      # rewrite the options list ("changed" with no spec change, only our managedFields entry).
       options:
         - key: server
           values: {{ cp.dns_forwarders | to_json }}
+        - key: local
+          values: ["/{{ rhoso_namespace }}.svc/"]
       override:
         service:
           metadata:
@@ -127,6 +131,7 @@ spec:
         cinder_store_project_name = service
         cinder_catalog_info = volumev3::internalURL
         cinder_use_multipath = true
+        cinder_volume_type = {{ glance_volume_type }}
       glanceAPIs:
         default:
           apiTimeout: 600

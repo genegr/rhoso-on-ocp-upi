@@ -2,7 +2,7 @@
 # Tempest (RHOSO 18.0 "Validating and troubleshooting the deployed cloud": test-operator, Tempest CR). Each run in
 # tempest_runs: a Tempest CR (python-tempestconf generates the config against the external network), waited for, its
 # pod log kept in .state/<env>/tempest/<run>.log with the totals. A finished run is left as it is; -e tempest_rerun=true
-# deletes and starts them again.
+# deletes and starts them again; -e tempest_retry=<run> runs only the tests that failed in <run>.
 - name: Nodes and their interfaces
   ansible.builtin.include_role:
     name: rhoso_networks
@@ -30,6 +30,24 @@
   changed_when: false
   failed_when: tp_net.rc | default(0) != 0 or tp_net.stdout | trim | length == 0
 
+- name: Service types in the catalog (which plugins run)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack service list -f value -c Type
+  register: tp_services
+  changed_when: false
+
+- name: Include list for "auto" runs (Tempest + plugins of the deployed services)
+  ansible.builtin.set_fact:
+    tp_include_auto: >-
+      {{ (['tempest\.']
+          + (tempest_plugins | dict2items | selectattr('value', 'in', tp_services.stdout_lines | map('trim') | list)
+             | map(attribute='key') | sort | list)) | join(tp_nl) }}
+    tp_plugins_left_out: >-
+      {{ tempest_plugins | dict2items | rejectattr('value', 'in', tp_services.stdout_lines | map('trim') | list)
+         | map(attribute='key') | sort | list }}
+
 - name: NAD {{ tempest_nad }} (macvlan on {{ tp_nic }}, {{ tp_base }}.{{ tempest_external_range[0] }}-{{ tempest_external_range[1] }})
   kubernetes.core.k8s:
     definition:
@@ -52,7 +70,25 @@
     namespace: "{{ rhoso_namespace }}"
   register: tp_now
 
-- name: Start over (tempest_rerun)
+# -e tempest_retry=<run>: one run, <run>-retry, of only the tests that failed in <run> (from its kept log). Always
+# fresh: an earlier <run>-retry CR is deleted first.
+- name: Runs to do
+  ansible.builtin.set_fact:
+    tp_runs: >-
+      {%- if tempest_retry is defined -%}
+      {%-   set lines = lookup('ansible.builtin.file', tp_dir ~ '/' ~ tempest_retry ~ '.log').splitlines()
+                        | select('search', '[.][.][.] FAILED$') | list -%}
+      {%-   set tests = lines | reject('search', 'setUpClass')
+                        | map('regex_replace', '^[{][0-9]+[}] ([^ ]+) .*$', '\1') | list -%}
+      {%-   set classes = lines | select('search', 'setUpClass')
+                          | map('regex_replace', '^.*setUpClass [(]([^)]+)[)].*$', '\1') | list -%}
+      {{ [{'name': tempest_retry ~ '-retry', 'smoke': false, 'include': (tests + classes) | join(tp_nl),
+           'timeout_min': 180, 'fresh': true}] }}
+      {%- else -%}
+      {{ tempest_runs }}
+      {%- endif -%}
+
+- name: Start over (tempest_rerun, or a retry run)
   kubernetes.core.k8s:
     api_version: test.openstack.org/v1beta1
     kind: Tempest
@@ -60,14 +96,14 @@
     name: "{{ item.name }}"
     state: absent
     wait: true
-  loop: "{{ tempest_runs }}"
+  loop: "{{ tp_runs }}"
   loop_control:
     label: "{{ item.name }}"
-  when: tempest_rerun | default(false) | bool
+  when: tempest_rerun | default(false) | bool or item.fresh | default(false)
 
 - name: Runs, one after the other
   ansible.builtin.include_tasks: run.yml
-  loop: "{{ tempest_runs }}"
+  loop: "{{ tp_runs }}"
   loop_control:
     loop_var: tr
     label: "{{ tr.name }}"

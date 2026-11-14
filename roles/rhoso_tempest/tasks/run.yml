@@ -12,41 +12,32 @@
         networkAttachments: ["{{ tempest_nad }}"]
         storageClass: "{{ e.rhoso.controlplane.storage_class }}"
         tempestRun: >-
-          {{ {'concurrency': tempest_concurrency}
-             | combine({'smoke': true} if tr.smoke else {'includeList': tr.include}) }}
+          {{ {'concurrency': tempest_concurrency,
+              'excludeList': tempest_exclude.splitlines() | map('trim') | select('match', '^[^#]') | join(tp_nl)}
+             | combine({'smoke': true} if tr.smoke
+                        else {'includeList': tp_include_auto if tr.include == 'auto' else tr.include}) }}
         tempestconfRun:
           create: true
           networkID: "{{ tp_net.stdout | trim }}"
           image: "{{ tempest_image_url }}"
-          overrides: |
-            validation.run_validation true
-            compute-feature-enabled.live_migration true
-            compute-feature-enabled.block_migration_for_live_migration true
-            identity.v3_endpoint_type public
+          deployerInput: "{{ tempest_deployer_input }}"
+          overrides: "{{ tempest_overrides | join(' ') }}"
   register: tp_cr
 
-- name: "{{ tr.name }}: finished"
-  kubernetes.core.k8s_info:
-    api_version: test.openstack.org/v1beta1
-    kind: Tempest
-    namespace: "{{ rhoso_namespace }}"
-    name: "{{ tr.name }}"
-  register: tp_state
-  until: >-
-    (tp_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
-     | map(attribute='status') | first | default('')) == 'True'
-    or (tp_state.resources[0].status.conditions | default([]) | selectattr('status', 'equalto', 'False')
-        | selectattr('severity', 'defined') | selectattr('severity', 'equalto', 'Error') | list | length > 0)
-  retries: "{{ (tr.timeout_min * 60 / 30) | int }}"
-  delay: 30
-  failed_when: false
-
-- name: "{{ tr.name }}: its pods"
+# The CR's conditions are no end marker: a run with failed tests ends with the pod in Failed and the CR reading
+# "NetworkAttachments error" (the finished pod has no interfaces left). The pod phase is.
+- name: "{{ tr.name }}: finished (its pod Succeeded or Failed)"
   kubernetes.core.k8s_info:
     kind: Pod
     namespace: "{{ rhoso_namespace }}"
     label_selectors: ["instanceName={{ tr.name }}"]
   register: tp_pods
+  until: >-
+    tp_pods.resources | length > 0
+    and tp_pods.resources | map(attribute='status.phase') | reject('in', ['Succeeded', 'Failed']) | list | length == 0
+  retries: "{{ (tr.timeout_min * 60 / 30) | int }}"
+  delay: 30
+  failed_when: false
 
 - name: "{{ tr.name }}: pod log"
   kubernetes.core.k8s_log:
@@ -66,7 +57,11 @@
 - name: "{{ tr.name }}: totals"
   ansible.builtin.debug:
     msg:
-      - "status: {{ tp_state.resources[0].status.conditions | default([]) | map(attribute='type') | zip(tp_state.resources[0].status.conditions | default([]) | map(attribute='status')) | map('join', '=') | join(', ') }}"
+      - "pod: {{ tp_pods.resources | map(attribute='status.phase') | join(', ') }}"
+      - "plugins left out (service not deployed): {{ tp_plugins_left_out | join(', ') }}"
       - "{{ (tp_log.log | default('')).splitlines() | select('search', '^ ?- (Passed|Skipped|Expected Fail|Unexpected Success|Failed): ') | list }}"
-      - "{{ (tp_log.log | default('')).splitlines() | select('search', 'Sum of execute time|Totals') | list }}"
+      - >-
+        {{ (tp_log.log | default('')).splitlines() | select('search', '[.][.][.] FAILED$')
+           | map('regex_replace', '^[{][0-9]+[}] ', '') | map('regex_replace', ' [[][0-9.]+s[]] [.][.][.] FAILED$', '')
+           | list }}
       - "log: .state/{{ env }}/tempest/{{ tr.name }}.log"

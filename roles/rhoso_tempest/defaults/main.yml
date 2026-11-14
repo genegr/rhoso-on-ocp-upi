@@ -1,19 +1,61 @@
 ---
-# Tempest through the test-operator (installed with the openstack-operator). Runs one after the other, each a Tempest CR:
+# Tempest through the test-operator (installed with the openstack-operator). Runs one after the other, each a Tempest CR.
+# include: regexes, or "auto" = all of Tempest plus the plugins of the services in the catalog (tempest_plugins).
+# (The test-operator's own default includeList is tempest.api.identity.v3 only.)
 tempest_runs:
   - name: tempest-smoke
     smoke: true
     include: ""
     timeout_min: 120
-  - name: tempest-api-scenario
+  - name: tempest-full
     smoke: false
-    include: |
-      tempest.api
-      tempest.scenario
-    timeout_min: 480
+    include: auto
+    timeout_min: 720
+# Other runs for -e (JSON): API + scenario only.
+#   {"name": "tempest-api-scenario", "smoke": false, "include": "tempest.api\ntempest.scenario", "timeout_min": 480}
+# Plugin test modules in the tempest image -> the catalog service type they test. A plugin runs only when its service
+# is deployed (l2gw: an extension RHOSO doesn't ship).
+tempest_plugins:
+  barbican_tempest_plugin: key-manager
+  cinder_tempest_plugin: volumev3
+  designate_tempest_plugin: dns
+  glance_tempest_plugin: image
+  heat_tempest_plugin: orchestration
+  ironic_tempest_plugin: baremetal
+  keystone_tempest_plugin: identity
+  manila_tempest_tests: sharev2
+  networking_l2gw_tempest_plugin: l2gw
+  neutron_tempest_plugin: network
+  octavia_tempest_plugin: load-balancer
+  telemetry_tempest_plugin: metric
+  watcher_tempest_plugin: infra-optim
 tempest_concurrency: 4
+# Left out of every run, each for a reason that is the design, not a fault:
+tempest_exclude: |
+  # No default network for auto-allocation (Neutron auto-allocated-topology): users get a starter network instead.
+  tempest.api.compute.admin.test_auto_allocate_network
+  # One instance + volume per compute (8) is more than Cinder's default project quota (10 volumes).
+  tempest.scenario.test_instances_with_cinder_volumes.TestInstancesWithCinderVolumes.test_instances_with_cinder_volumes_on_all_compute_nodes
+# python-tempestconf input, before its discovery (INI; values may hold spaces, unlike tempestconfRun.overrides).
+tempest_deployer_input: |
+  [volume]
+  vendor_name = Pure Storage
+  storage_protocol = iSCSI
+# Last word after discovery ("section.key value", no spaces in values). Octavia isn't deployed, but its plugin's tests
+# ran without this (setUpClass "No load-balancer_admin role found").
+tempest_overrides:
+  - validation.run_validation true
+  - compute-feature-enabled.live_migration true
+  - compute-feature-enabled.block_migration_for_live_migration true
+  # Mixed CPUs (Intel + AMD node sets): the scheduler picks the destination, not Tempest (any other host).
+  - compute-feature-enabled.can_migrate_between_any_hosts false
+  - identity.v3_endpoint_type public
+  - service_available.load_balancer false
 # The pod needs to reach the floating IPs (validation and scenario tests SSH into instances): a macvlan leg on the OCP
 # nodes' NIC on the external port group (ovn_datacentre_portgroup, unused by OVN since the gateways are on the computes).
 tempest_nad: tempest-ext                # <= 15 characters: the pod interface is named after it (IFNAMSIZ) and the operator compares them
 tempest_external_range: [230, 235]      # host numbers in networks.external, outside the FIP pool, router, netcheck
 tempest_image_url: https://download.cirros-cloud.net/0.6.3/cirros-0.6.3-x86_64-disk.img
+# A real newline for joins: join('\n') inside a folded YAML block gives the two characters "\\" "n" (one regex
+# matching nothing). YAML turns "\n" into the newline here.
+tp_nl: "\n"

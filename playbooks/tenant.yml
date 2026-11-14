@@ -24,6 +24,13 @@
   module_defaults:
     kubernetes.core.k8s_exec: {namespace: openstack, pod: openstackclient}
   tasks:
+    - name: No check mode (k8s_exec runs its commands even under --check)
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+        fail_msg: "tenant.yml has no dry run: every OpenStack call goes through k8s_exec, which ignores --check"
+        quiet: true
+      tags: [always]
+
     - name: Tenants are configured
       ansible.builtin.assert:
         that:

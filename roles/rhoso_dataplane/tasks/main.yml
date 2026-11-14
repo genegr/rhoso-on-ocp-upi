@@ -1,14 +1,37 @@
 ---
 # Deploying RHOSO 18.0, "Creating the data plane" (pre-provisioned nodes): secrets, the Pure multipath / udev / Nova
-# multipath customizations, the OpenStackDataPlaneNodeSet and an OpenStackDataPlaneDeployment.
+# multipath customizations, the OpenStackDataPlaneNodeSet(s) and an OpenStackDataPlaneDeployment.
 # Layout from openstack-k8s-operators/architecture lib/dataplane + examples/va/hci (nodeset values).
 #   -e dataplane_limit=<host>  deploy one host first (deployment edpm-<host>); without it: edpm-all.
+#   -e dataplane_services=<a,b>  run only these services (servicesOverride, applied to every node set of the
+#                              deployment), e.g. a node set's nova-<node set> service after a Nova config change,
+#   -e dataplane_nodesets=<a,b>  with only these node sets (default: all; one per run with dataplane_services).
 # A deployment is a one-shot run: a finished one is left as it is; -e dataplane_run=<suffix> starts a new one.
+# One node set (rhoso.dataplane.nodeset) by default. With rhoso.dataplane.cpu_groups, one node set per group (hosts by
+# model), each with its own Nova service carrying the group's guest CPU models (cpu_mode custom): host-model breaks
+# live migration between different CPUs ("guest CPU doesn't match specification: missing features").
 - name: Values
   ansible.builtin.set_fact:
     dp: "{{ e.rhoso.dataplane }}"
     dp_dir: "{{ state_dir }}/dataplane"
     dp_deployment: "edpm-{{ dataplane_limit | default('all') }}{{ ('-' ~ dataplane_run) if dataplane_run is defined else '' }}"
+    dp_nodesets: >-
+      {%- set out = [] -%}
+      {%- for g in e.rhoso.dataplane.cpu_groups | default([{'nodeset': e.rhoso.dataplane.nodeset}]) -%}
+      {%-   set hosts = e.edpm_hosts if g.models is not defined
+                        else e.edpm_hosts | selectattr('model', 'in', g.models) | list -%}
+      {%-   set _ = out.append({'name': g.nodeset, 'hosts': hosts, 'cpu_models': g.cpu_models | default([]),
+                                'nova': ('nova-' ~ g.nodeset) if g.cpu_models is defined else 'nova'}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Every host in exactly one node set
+  ansible.builtin.assert:
+    that:
+      - (dp_nodesets | map(attribute='hosts') | flatten | map(attribute='name') | list | sort)
+        == (e.edpm_hosts | map(attribute='name') | list | sort)
+    fail_msg: "rhoso.dataplane.cpu_groups must place each edpm_hosts entry (by model) in exactly one node set"
+    quiet: true
 
 - name: State directory
   ansible.builtin.file:
@@ -89,6 +112,57 @@
   loop_control:
     label: "{{ item.name }}"
 
+# skip_cpu_compare_on_dest: RHOSO's 01-nova.conf sets it true only because the compare is wrong with host-model
+# (nova bug 2039803). With custom models the compare is right, and it is what keeps a live migration off a host of the
+# other CPU group: the destination's pre-check refuses it and the conductor tries the next host. Skipped, the
+# migration starts and libvirt aborts it ("guest CPU doesn't match specification"), with no retry.
+- name: ConfigMaps nova-cpu-<node set> (guest CPU models of each CPU group)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "nova-cpu-{{ item.name }}"
+        namespace: "{{ rhoso_namespace }}"
+      data:
+        26-nova-cpu.conf: |
+          [libvirt]
+          cpu_mode = custom
+          cpu_models = {{ item.cpu_models | join(',') }}
+          [workarounds]
+          skip_cpu_compare_on_dest = false
+  loop: "{{ dp_nodesets | selectattr('cpu_models') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# The custom Nova service of a CPU group is the operator's nova service plus the group's ConfigMap
+# (edpmServiceType nova: the operator handles it as Nova). Copied from the live service, so it follows operator updates.
+- name: Default nova service
+  kubernetes.core.k8s_info:
+    api_version: dataplane.openstack.org/v1beta1
+    kind: OpenStackDataPlaneService
+    namespace: "{{ rhoso_namespace }}"
+    name: nova
+  register: dp_nova_svc
+  when: dp_nodesets | selectattr('cpu_models') | list | length > 0
+
+- name: Custom data-plane services nova-<node set>
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: dataplane.openstack.org/v1beta1
+      kind: OpenStackDataPlaneService
+      metadata:
+        name: "{{ item.nova }}"
+        namespace: "{{ rhoso_namespace }}"
+      spec: >-
+        {{ dp_nova_svc.resources[0].spec
+           | combine({'edpmServiceType': 'nova',
+                      'dataSources': dp_nova_svc.resources[0].spec.dataSources
+                                     + [{'configMapRef': {'name': 'nova-cpu-' ~ item.name}}]}) }}
+  loop: "{{ dp_nodesets | selectattr('cpu_models') | list }}"
+  loop_control:
+    label: "{{ item.nova }}"
+
 # Nova multipath needs no custom service: the default nova service mounts the optional ConfigMap nova-extra-config.
 - name: Custom data-plane service pure-storage-udev (the OCP nodes' Pure udev rules, from the OCP repo)
   kubernetes.core.k8s:
@@ -101,15 +175,7 @@
       spec:
         playbookContents: "{{ lookup('ansible.builtin.template', 'pure-storage-udev.yml.j2') }}"
 
-- name: OpenStackDataPlaneNodeSet rendered (kept in .state for review; no secrets in it)
-  ansible.builtin.template:
-    src: nodeset.yaml.j2
-    dest: "{{ dp_dir }}/nodeset.yaml"
-    mode: "0600"
-  check_mode: false
-  changed_when: false
-
-- name: Deployments of the node set
+- name: Deployments of the node sets
   kubernetes.core.k8s_info:
     api_version: dataplane.openstack.org/v1beta1
     kind: OpenStackDataPlaneDeployment
@@ -120,37 +186,37 @@
 - name: Deployments still running
   ansible.builtin.set_fact:
     dp_running: >-
+      {%- set names = dp_nodesets | map(attribute='name') | list -%}
       {%- set out = [] -%}
-      {%- for d in dp_all.resources if dp.nodeset in d.spec.nodeSets -%}
+      {%- for d in dp_all.resources if d.spec.nodeSets | intersect(names) | length > 0 -%}
       {%-   set r = d.status.conditions | default([]) | selectattr('type', 'equalto', 'DeploymentReady')
                     | map(attribute='reason') | first | default('') -%}
       {%-   if r not in ['Ready', 'Error', 'BackoffLimitExceeded'] -%}{%- set _ = out.append(d.metadata.name) -%}{%- endif -%}
       {%- endfor -%}
       {{ out }}
 
-- name: OpenStackDataPlaneNodeSet {{ dp.nodeset }}
-  kubernetes.core.k8s:
-    src: "{{ dp_dir }}/nodeset.yaml"
-  when: dp_running | length == 0
-
-- name: Node set left as it is (locked by a running deployment)
-  ansible.builtin.debug:
-    msg: "{{ dp.nodeset }} not applied: deployment(s) {{ dp_running | join(', ') }} still running"
-  when: dp_running | length > 0
-
-- name: Node set ready for deployment (SetupReady)
+- name: Existing node sets
   kubernetes.core.k8s_info:
     api_version: dataplane.openstack.org/v1beta1
     kind: OpenStackDataPlaneNodeSet
     namespace: "{{ rhoso_namespace }}"
-    name: "{{ dp.nodeset }}"
-  register: ns_state
-  until: >-
-    (ns_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'SetupReady')
-     | map(attribute='status') | first | default('')) == 'True'
-  retries: 30
-  delay: 10
-  when: not ansible_check_mode
+  register: dp_ns_existing
+
+# Existing node sets first: a host moving to a new node set keeps its IPSet (named after the host, owned by the node
+# set) until the old node set lets it go, and the new node set waits for that (nodeset.yml).
+- name: Node sets
+  ansible.builtin.include_tasks: nodeset.yml
+  loop: >-
+    {%- set have = dp_ns_existing.resources | map(attribute='metadata.name') | list -%}
+    {{ (dp_nodesets | selectattr('name', 'in', have) | list) + (dp_nodesets | rejectattr('name', 'in', have) | list) }}
+  loop_control:
+    loop_var: ns
+    label: "{{ ns.name }}"
+
+- name: Node sets left as they are (locked by a running deployment)
+  ansible.builtin.debug:
+    msg: "node sets not applied: deployment(s) {{ dp_running | join(', ') }} still running"
+  when: dp_running | length > 0
 
 # -e dataplane_deploy=false: node set only (nothing runs on the hosts), e.g. to review the generated inventory.
 - name: Existing deployment {{ dp_deployment }}
@@ -170,7 +236,11 @@
       metadata:
         name: "{{ dp_deployment }}"
         namespace: "{{ rhoso_namespace }}"
-      spec: "{{ {'nodeSets': [dp.nodeset]} | combine({'ansibleLimit': dataplane_limit} if dataplane_limit is defined else {}) }}"
+      spec: >-
+        {{ {'nodeSets': dataplane_nodesets.split(',') if dataplane_nodesets is defined
+                        else dp_nodesets | map(attribute='name') | list}
+           | combine({'ansibleLimit': dataplane_limit} if dataplane_limit is defined else {})
+           | combine({'servicesOverride': dataplane_services.split(',')} if dataplane_services is defined else {}) }}
   when: dataplane_deploy | default(true) | bool and dp_existing.resources | length == 0
 
 - name: Deployment {{ dp_deployment }} finished

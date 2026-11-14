@@ -1,9 +1,10 @@
 ---
-# Tempest against the cloud (last gate before users get access), through the test-operator: smoke, then API +
-# scenario (roles/rhoso_tempest/defaults). The test pod gets a leg on the external network (NAD tempest-ext) to
-# reach the floating IPs it creates. Long (smoke ~30-60 min, API+scenario ~2-4 h): run in the background with output to
-# .state/rhoso-tempest.log. Logs: .state/<env>/tempest/<run>.log. -e tempest_rerun=true starts the runs again.
-#   ansible-playbook playbooks/tempest.yml -e env=<name> [-e tempest_rerun=true]
+# Tempest against the cloud (last gate before users get access), through the test-operator: smoke, then the full
+# suite: Tempest + the plugins of the deployed services (roles/rhoso_tempest/defaults). The test pod gets a leg on
+# the external network (NAD tempest-ext) to reach the floating IPs it creates. Long (smoke ~10 min, full several
+# hours): run in the background with output to .state/rhoso-tempest.log. Logs: .state/<env>/tempest/<run>.log. -e tempest_rerun=true starts the runs again;
+# -e tempest_retry=<run> runs only the tests that failed in <run>.
+#   ansible-playbook playbooks/tempest.yml -e env=<name> [-e tempest_rerun=true | -e tempest_retry=<run>]
 - name: Environment
   hosts: localhost
   gather_facts: false

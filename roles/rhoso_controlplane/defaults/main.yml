@@ -49,3 +49,9 @@ rhoso_controlplane_name: controlplane
 # also Cinder's default_volume_type.
 cinder_backend: pure
 cinder_volume_type: pure
+
+# Glance on Cinder: image volumes of a multiattach type. With a plain type an image volume takes one attachment at a
+# time, and concurrent downloads (one image booting on several computes at once) fail with HTTP 500 ("status must be
+# available or downloading to reserve, but the current status is attaching"). Private: only the service project
+# (Glance's volumes) uses it.
+glance_volume_type: glance-multiattach

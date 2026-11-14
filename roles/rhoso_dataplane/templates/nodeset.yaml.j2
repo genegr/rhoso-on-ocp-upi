@@ -6,7 +6,7 @@
 apiVersion: dataplane.openstack.org/v1beta1
 kind: OpenStackDataPlaneNodeSet
 metadata:
-  name: {{ dp.nodeset }}
+  name: {{ ns.name }}
   namespace: {{ rhoso_namespace }}
 spec:
   env:
@@ -30,7 +30,7 @@ spec:
     - ovn
     - neutron-metadata
     - libvirt
-    - nova
+    - {{ ns.nova }}
   nodeTemplate:
     ansibleSSHPrivateKeySecret: dataplane-ansible-ssh-private-key-secret
     managementNetwork: ctlplane
@@ -124,7 +124,7 @@ spec:
           {% endfor %}
 {% endraw %}
   nodes:
-{% for h in e.edpm_hosts %}
+{% for h in ns.hosts %}
 {%   set hostnum = h.ip.split('.')[-1] %}
     {{ h.name }}:
       hostName: {{ h.name }}

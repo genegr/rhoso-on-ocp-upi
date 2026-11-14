@@ -191,6 +191,67 @@
       --property volume_backend_name={{ cinder_backend }}
       --description "Everpure FlashArray (iSCSI, multipath)" {{ cinder_volume_type }}
   when: >-
+    not ansible_check_mode and (
     cp_vtype.rc | default(1) != 0
     or (cp_vtype.stdout | from_json).properties | default('') | string
-       is not search('volume_backend_name\\W+' ~ cinder_backend ~ '\\b')
+       is not search('volume_backend_name\\W+' ~ cinder_backend ~ '\\b'))
+
+- name: Volume type {{ glance_volume_type }} (current)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack volume type show {{ glance_volume_type }} -f json
+  register: cp_gtype
+  changed_when: false
+  failed_when: false
+  check_mode: false                       # read-only
+
+- name: Project service (Glance's image volumes)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack project show service -f value -c id
+  register: cp_service_project
+  changed_when: false
+  check_mode: false                       # read-only
+
+- name: Volume type {{ glance_volume_type }} -> back end {{ cinder_backend }}, multiattach, for project service
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: >-
+      openstack volume type {{ 'create --private' if cp_gtype.rc | default(1) != 0 else 'set' }}
+      --property volume_backend_name={{ cinder_backend }} --property "multiattach=<is> True"
+      --project {{ cp_service_project.stdout | trim }}
+      --description "Glance image volumes (multiattach)" {{ glance_volume_type }}
+  vars:
+    cp_gt: "{{ cp_gtype.stdout | from_json if cp_gtype.rc | default(1) == 0 else {} }}"
+  when: >-
+    not ansible_check_mode and (
+    cp_gtype.rc | default(1) != 0
+    or cp_gt.properties | default('') | string is not search('volume_backend_name\\W+' ~ cinder_backend ~ '\\b')
+    or cp_gt.properties | default('') | string is not search('multiattach\\W+<is> True')
+    or cp_service_project.stdout | trim not in cp_gt.access_project_ids | default('') | string)
+
+# Images uploaded before (or by a Glance without) cinder_volume_type: their volumes (image-<id>, project service) go to
+# the multiattach type by a retype on the same back end (no data copy, image IDs unchanged).
+- name: Image volumes (project service)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack volume list --project {{ cp_service_project.stdout | trim }} --long -f json
+  register: cp_image_vols
+  changed_when: false
+  check_mode: false                       # read-only
+
+- name: Image volumes -> {{ glance_volume_type }}
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack volume set --type {{ glance_volume_type }} --retype-policy never {{ item.ID }}
+  loop: >-
+    {{ cp_image_vols.stdout | from_json | selectattr('Name', 'match', 'image-')
+       | rejectattr('Type', 'equalto', glance_volume_type) | selectattr('Status', 'equalto', 'available') | list }}
+  loop_control:
+    label: "{{ item.Name }} ({{ item.Type }})"
+  when: not ansible_check_mode
