@@ -36,7 +36,9 @@ TCP 443 to `<ingress VIP>` must also be reachable (`Test-NetConnection <ingress 
   oc -n openstack get secret osp-secret -o jsonpath='{.data.AdminPassword}' | base64 -d; echo
   ```
 - `osp-secret` owns this password: **don't change it in Horizon or with `openstack user set`**, or the secret and
-  Keystone stop matching. For people, create users and projects of your own (Identity → Users / Projects).
+  Keystone stop matching. To choose it, set `vault_rhoso_admin_password` in `envs/vault.yml` and run
+  `rhoso.yml --tags controlplane`. For people, create users and projects of your own (Identity → Users / Projects),
+  or tenants with `tenant.yml` (standard password: `vault_tenant_password`).
 
 ## 3. TLS certificate (once per machine)
 The public endpoints use certificates from RHOSO's own CA (`rootca-public`), not a public one, so browsers and the

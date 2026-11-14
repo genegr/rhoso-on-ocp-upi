@@ -36,20 +36,40 @@ tempest_exclude: |
   tempest.api.compute.admin.test_auto_allocate_network
   # One instance + volume per compute (8) is more than Cinder's default project quota (10 volumes).
   tempest.scenario.test_instances_with_cinder_volumes.TestInstancesWithCinderVolumes.test_instances_with_cinder_volumes_on_all_compute_nodes
+  # Cinder enforces service-token roles (service_token_roles_required, the OSSA-2023-003 fix) and answers a detach with a
+  # fake service token 401; this Tempest only accepts 403/409 (upstream master accepts 401 too).
+  tempest.scenario.test_server_volume_attachment.TestServerVolumeAttachScenarioOldVersion.test_old_versions_reject
+  tempest.scenario.test_server_volume_attachment.TestServerVolumeAttachmentScenario.test_server_detach_rules
+  # After an expected SSH timeout these run "sudo ip netns" for diagnostics, which the unprivileged test pod refuses
+  # (ShellCommandFailed). Port forwarding itself passes in the other PortForwarding tests.
+  neutron_tempest_plugin.scenario.test_port_forwardings.PortForwardingTestJSON.test_port_forwarding_editing_and_deleting_tcp_rule
+  neutron_tempest_plugin.scenario.test_port_forwardings.PortForwardingTestJSON.test_port_forwarding_to_2_fixed_ips
+  # Per-project Barbican quotas need a "key-manager:service-admin" role, which RHOSO doesn't define.
+  barbican_tempest_plugin.tests.api.test_quotas.ProjectQuotasTest
 # python-tempestconf input, before its discovery (INI; values may hold spaces, unlike tempestconfRun.overrides).
+# dhcp_domain: RHOSO's nova metadata has dhcp_domain = '' (Tempest's default ".novalocal" made the FQDN hostname test
+# compare against <name>.novalocal); an empty value can't go through overrides.
 tempest_deployer_input: |
   [volume]
   vendor_name = Pure Storage
   storage_protocol = iSCSI
+  [compute-feature-enabled]
+  dhcp_domain =
 # Last word after discovery ("section.key value", no spaces in values). Octavia isn't deployed, but its plugin's tests
 # ran without this (setUpClass "No load-balancer_admin role found").
 tempest_overrides:
   - validation.run_validation true
+  # python-tempestconf sets image_ssh_user only; the alt image (CirrOS too) kept "root", which CirrOS refuses
+  # ("Please login as 'cirros' user") after a rebuild onto it.
+  - validation.image_alt_ssh_user cirros
   - compute-feature-enabled.live_migration true
   - compute-feature-enabled.block_migration_for_live_migration true
   # Mixed CPUs (Intel + AMD node sets): the scheduler picks the destination, not Tempest (any other host).
   - compute-feature-enabled.can_migrate_between_any_hosts false
   - identity.v3_endpoint_type public
+  # Nova's verify_glance_signatures stays off (decision 2026-11-14): Nova checks signatures only for requests with
+  # trusted certificate IDs, so a bad-signature image without them boots. Tells Barbican's image-signing tests so.
+  - image_signature_verification.enforced false
   - service_available.load_balancer false
 # The pod needs to reach the floating IPs (validation and scenario tests SSH into instances): a macvlan leg on the OCP
 # nodes' NIC on the external port group (ovn_datacentre_portgroup, unused by OVN since the gateways are on the computes).

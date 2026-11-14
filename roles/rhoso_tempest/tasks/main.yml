@@ -78,10 +78,12 @@
       {%- if tempest_retry is defined -%}
       {%-   set lines = lookup('ansible.builtin.file', tp_dir ~ '/' ~ tempest_retry ~ '.log').splitlines()
                         | select('search', '[.][.][.] FAILED$') | list -%}
+      {#-   Backreferences as '\\1': in a folded block Jinja reads '\1' as the character \x01. The [id-...,tags]
+            suffix goes too: include lines are regexes, and it would read as a character class. -#}
       {%-   set tests = lines | reject('search', 'setUpClass')
-                        | map('regex_replace', '^[{][0-9]+[}] ([^ ]+) .*$', '\1') | list -%}
+                        | map('regex_replace', '^[{][0-9]+[}] ([^ \\[]+).*$', '\\1') | list -%}
       {%-   set classes = lines | select('search', 'setUpClass')
-                          | map('regex_replace', '^.*setUpClass [(]([^)]+)[)].*$', '\1') | list -%}
+                          | map('regex_replace', '^.*setUpClass [(]([^)]+)[)].*$', '\\1') | list -%}
       {{ [{'name': tempest_retry ~ '-retry', 'smoke': false, 'include': (tests + classes) | join(tp_nl),
            'timeout_min': 180, 'fresh': true}] }}
       {%- else -%}

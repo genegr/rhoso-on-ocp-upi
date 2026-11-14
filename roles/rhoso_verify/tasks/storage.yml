@@ -1,6 +1,32 @@
 ---
 # Pure iSCSI from the computes: a volume attached to the first instance (multipath on its compute, write/read in the
 # guest), and an instance booted from a volume.
+# iSCSI records made on a compute outside OpenStack, by an iscsiadm newer than nova_compute's, make every os-brick call
+# on that target fail (found 2026-11-14 on two computes: "Unknown parameter name node.session.conn_reopen_log_freq",
+# every attach failed). Read-only: the record files, for that parameter (podman exec over SSH is refused on the
+# computes: "nsenter: stat of /proc/1/ns/user failed").
+- name: iSCSI records nova_compute's iscsiadm can't read (all computes)
+  ansible.builtin.find:
+    paths: /var/lib/iscsi/nodes
+    patterns: default
+    recurse: true
+    contains: '^node\.session\.conn_reopen_log_freq'
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['edpm'] }}"
+  register: vr_iscsi_recs
+
+- name: Record the unreadable iSCSI records
+  ansible.builtin.include_tasks: check.yml
+  vars:
+    vr_bad_recs: "{{ vr_iscsi_recs.results | selectattr('matched', 'gt', 0) | map(attribute='item') | list }}"
+    chk:
+      phase: storage
+      name: iSCSI records readable by nova_compute on every compute
+      ok: "{{ vr_bad_recs | length == 0 }}"
+      detail: >-
+        {{ ('unreadable on ' ~ vr_bad_recs | join(', ') ~ ' (host-made records? log out, remove them)') if vr_bad_recs
+           else 'all ' ~ groups['edpm'] | length ~ ' computes' }}
+
 - name: Volume {{ verify_prefix }}-vol ({{ verify_volume_gb }} GB, type {{ cinder_volume_type | default('pure') }})
   kubernetes.core.k8s_exec:
     command: >-

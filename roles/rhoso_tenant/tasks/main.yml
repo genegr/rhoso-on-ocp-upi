@@ -29,6 +29,16 @@
   register: tn_users
   no_log: true
 
+# vault_tenant_password (optional): one standard password for every tenant user, written over the generated files.
+- name: "{{ t.name }}: standard password from the vault into .state/<env>/tenants/"
+  ansible.builtin.copy:
+    content: "{{ vault_tenant_password }}"
+    dest: "{{ state_dir }}/tenants/{{ item }}.password"
+    mode: "0600"
+  loop: "{{ t.users }}"
+  when: vault_tenant_password is defined
+  no_log: true
+
 - name: "{{ t.name }}: create the missing users (password generated once into .state/<env>/tenants/)"
   ansible.builtin.uri:
     url: "{{ tenant_keystone_url }}/v3/users"
@@ -46,6 +56,45 @@
                              chars=['ascii_letters', 'digits']) }}"
     status_code: [201]
   loop: "{{ tn_users.results | selectattr('json.users', 'equalto', []) | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  changed_when: true
+  no_log: true
+
+# The .state file is each user's password. An existing user that can't log in with it (vault_tenant_password set
+# later, or the file replaced) gets it through the API. The login decides, so a second run reports changed=0.
+- name: "{{ t.name }}: users log in with their .state password"
+  ansible.builtin.uri:
+    url: "{{ tenant_keystone_url }}/v3/auth/tokens"
+    method: POST
+    ca_path: "{{ tn_ca }}"
+    body_format: json
+    body:
+      auth:
+        identity:
+          methods: [password]
+          password:
+            user:
+              name: "{{ item }}"
+              domain: {id: "{{ tn_domain_id }}"}
+              password: "{{ lookup('ansible.builtin.file', state_dir ~ '/tenants/' ~ item ~ '.password') }}"
+    status_code: [201, 401]
+  loop: "{{ t.users }}"
+  register: tn_login
+  no_log: true
+
+- name: "{{ t.name }}: set the .state password on the users that couldn't log in"
+  ansible.builtin.uri:
+    url: "{{ tenant_keystone_url }}/v3/users/{{ (tn_users.results | selectattr('item', 'equalto', item.item) | first).json.users[0].id }}"
+    method: PATCH
+    headers: {X-Auth-Token: "{{ tn_admin_token }}"}
+    ca_path: "{{ tn_ca }}"
+    body_format: json
+    body:
+      user:
+        password: "{{ lookup('ansible.builtin.file', state_dir ~ '/tenants/' ~ item.item ~ '.password') }}"
+    status_code: [200]
+  loop: "{{ tn_login.results | selectattr('status', 'equalto', 401) | list }}"
   loop_control:
     label: "{{ item.item }}"
   changed_when: true

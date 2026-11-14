@@ -40,12 +40,33 @@ Look at the `... FAILED` lines and the traceback for each. Then group the failur
 - a real fault (find it in the service logs: `oc -n openstack logs <pod>`, or on a compute
   `podman logs nova_compute`).
 
-Things found so far:
+Things found so far (2026-11-14, the full suite ended 1943 passed / 11 failed, the retry 33 / 0):
 - Glance image downloads failing with HTTP 500 "attaching": the Glance image volumes must use the multiattach type
   (`glance_volume_type` in `rhoso_controlplane`).
-- Rebuild tests failing: someone deleted `cirros-..._alt` in Horizon during the run.
+- Snapshot 404s and Glance 500s with "VolumeLimitExceeded" in Glance: every image is a volume in project `service`,
+  whose default quota is 10 volumes. `glance_service_quota` makes it unlimited.
+- Volume attach and live migration with a volume failing on one compute, with "Unknown parameter name
+  node.session.conn_reopen_log_freq": the host had iSCSI records made outside OpenStack (CLAUDE.md, `verify.yml`).
+- Rebuild tests failing: someone deleted `cirros-..._alt` in Horizon during the run. Rebuild onto the alt image
+  failing with "Please login as 'cirros'": `validation.image_alt_ssh_user cirros`.
+- FQDN hostname test timing out: Tempest's default `dhcp_domain` `.novalocal` doesn't match RHOSO's empty one, so
+  the deployer input sets it empty.
 - Live block migration failing with "missing features": Intel and AMD hosts were in one CPU group (`cpu_groups`).
 - Octavia setUpClass failing: Octavia isn't deployed, so `load_balancer false`.
+- Excluded by design, each with its reason in `tempest_exclude`:
+  - the Cinder service-token detach tests (401);
+  - two port-forwarding tests whose diagnostics need `sudo` in the pod;
+  - Barbican project quotas.
 
-Leftovers of a killed run show up in `openstack server list --all-projects` and `image list` as `tempest-*` objects.
-Delete them, and keep the base objects `verify.yml` made.
+  Image signing isn't enforced in Nova (decision 2026-11-14), and Tempest is told so.
+- `tempest_retry` reads the `... FAILED` lines of the kept log. It strips the `[id-...]` suffix: include lines are
+  regexes.
+
+The CRs have `cleanup: true`, so `tempest cleanup` removes what the tests left. A killed run still leaves
+`tempest-*` projects and users, plus their servers, volumes, routers and networks:
+1. `openstack project purge --project <p>` for each project (it skips Neutron);
+2. then the Neutron objects, filtered by owner ID (`--project` no longer resolves a deleted project);
+3. then the users.
+
+python-tempestconf creates the users `demo_tempestconf` and `alt_demo_tempestconf`, reuses the project `demo`, and
+uploads public `cirros-*-disk.img` copies. Keep the base objects `verify.yml` made.

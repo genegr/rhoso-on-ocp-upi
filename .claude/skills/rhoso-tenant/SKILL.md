@@ -15,9 +15,13 @@ ansible-playbook playbooks/tenant.yml -e env=<name> [-e tenant=<name>] --tags ch
   properties}`. Pin a release by its `SHA256SUMS` (a dated release, at least two weeks old; ask the user about a newer
   one). Each image is downloaded once into `.state/<env>/images`, copied into the `openstackclient` pod, created if
   missing, then removed from the pod. Big images take minutes, because Glance writes them to a Cinder volume.
-- **Tenants**: `tenants:` in the env file. Each user's password is generated once into
-  `.state/<env>/tenants/<user>.password`. It never goes into chat or git, and the user hands it out out of band. The
-  user names and the projects are the user's to choose: never invent them.
+- **Tenants**: `tenants:` in the env file. Each user's password is the file `.state/<env>/tenants/<user>.password`.
+  It is generated once, or, when `vault_tenant_password` is set in `envs/vault.yml`, the vault's value is written
+  there. If an existing user can't log in with the file's password, the play sets it through the Keystone API.
+  Passwords never go into chat, git or a command line. The user names and the projects are the user's to choose:
+  never invent them.
+- The admin password works the same way through `vault_rhoso_admin_password` and `rhoso.yml --tags controlplane`
+  (`osp-secret`). Never change it during a Tempest run, which uses admin.
 - The starter network uses Neutron's default DNS (the AD DC, through the router's masquerade) and tenant MTU 1500.
 - `--tags check` logs in as the tenant user and confirms:
   - admin calls are refused;

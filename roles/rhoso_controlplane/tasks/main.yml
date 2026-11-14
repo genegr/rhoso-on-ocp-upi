@@ -50,6 +50,21 @@
     state: directory
     mode: "0700"
 
+# vault_rhoso_admin_password (optional): the admin password, written over the generated file. On a new control plane
+# osp-secret carries it to Keystone's bootstrap; on a running one Keystone gets it first through its API
+# (admin_password.yml), then osp-secret and with it the openstackclient's clouds config.
+- name: Admin password into Keystone first (running control plane)
+  ansible.builtin.include_tasks: admin_password.yml
+  when: vault_rhoso_admin_password is defined
+
+- name: AdminPassword from the vault
+  ansible.builtin.copy:
+    content: "{{ vault_rhoso_admin_password }}"
+    dest: "{{ cp_osp_dir }}/AdminPassword"
+    mode: "0600"
+  when: vault_rhoso_admin_password is defined
+  no_log: true
+
 - name: osp-secret (passwords generated once, kept in .state)
   kubernetes.core.k8s:
     definition:
@@ -69,6 +84,7 @@
                                  cp_osp_dir ~ '/BarbicanSimpleCryptoKEK-raw', length=32,
                                  chars=['ascii_letters', 'digits']) | b64encode}) -%}
         {{ out }}
+  register: cp_osp_secret
   no_log: true
 
 - name: Cinder Pure back end secret (API token of the dedicated array user)
@@ -169,6 +185,44 @@
   changed_when: false
   when: not ansible_check_mode and not (cp.ocp_nodes_gateway | default(false) | bool)
 
+# A changed osp-secret (e.g. a new AdminPassword) rolls Keystone and recreates the openstackclient pod while the
+# control plane still reads Ready: the CLI calls below got 401 until both had rolled (found 2026-11-14).
+- name: Admin login works from the openstackclient pod (after an osp-secret change)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack token issue -f value -c expires
+  register: cp_login
+  until: cp_login.rc | default(1) == 0
+  retries: 60
+  delay: 10
+  changed_when: false
+  when: not ansible_check_mode and cp_osp_secret is changed
+
+# Without nicMappings the OCP nodes run no ovn-controller, but their old chassis stay in Neutron as dead
+# "OVN Controller Gateway agent" entries (found 2026-11-14): delete those of the OCP nodes once they're dead.
+- name: Network agents (current)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack network agent list -f json
+  register: cp_agents
+  changed_when: false
+  check_mode: false                       # read-only
+  when: not (cp.ocp_nodes_gateway | default(false) | bool)
+
+- name: Dead OVN agents of the OCP nodes removed
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack network agent delete {{ item.ID }}
+  loop: >-
+    {{ cp_agents.stdout | default('[]') | from_json | selectattr('Host', 'in', rn_nodes | map(attribute='hostname') | list)
+       | rejectattr('Alive') | list }}
+  loop_control:
+    label: "{{ item.Host }} ({{ item['Agent Type'] }})"
+  when: not ansible_check_mode and not (cp.ocp_nodes_gateway | default(false) | bool)
+
 # Volume type for the Pure back end, Cinder's default_volume_type (customServiceConfig in the template). The toolbox has
 # no OpenStack SDK: the CLI runs in the openstackclient pod, as the docs do. Read first, create only when missing.
 - name: Volume type {{ cinder_volume_type }} (current)
@@ -232,6 +286,36 @@
     or cp_gt.properties | default('') | string is not search('volume_backend_name\\W+' ~ cinder_backend ~ '\\b')
     or cp_gt.properties | default('') | string is not search('multiattach\\W+<is> True')
     or cp_service_project.stdout | trim not in cp_gt.access_project_ids | default('') | string)
+
+# Every image is a volume in project service, whose Cinder default quota (10 volumes) capped the whole cloud at about
+# 10 images and made concurrent uploads and snapshots fail ("VolumeLimitExceeded" in Glance, HTTP 500; found
+# 2026-11-14 with Tempest). The array's realm or pod quota is the real limit.
+- name: Cinder quota of project service (current)
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack quota show --volume {{ cp_service_project.stdout | trim }} -f json
+  register: cp_service_quota
+  changed_when: false
+  check_mode: false                       # read-only
+
+- name: Cinder quota of project service -> unlimited ({{ glance_service_quota | join(', ') }})
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: >-
+      openstack quota set {{ glance_service_quota | map('regex_replace', '^(.*)$', '--\1 -1') | join(' ') }}
+      {{ cp_service_project.stdout | trim }}
+  vars:
+    # quota show prints a list of {Resource, Limit} or a dict, depending on the client: normalise both.
+    cp_sq_raw: "{{ cp_service_quota.stdout | from_json }}"
+    cp_sq: >-
+      {{ cp_sq_raw if cp_sq_raw is mapping
+         else dict(cp_sq_raw | map(attribute='Resource') | zip(cp_sq_raw | map(attribute='Limit'))) }}
+  when: >-
+    not ansible_check_mode
+    and glance_service_quota | reject('in', cp_sq | dict2items | selectattr('value', 'equalto', -1)
+                                        | map(attribute='key') | list) | list | length > 0
 
 # Images uploaded before (or by a Glance without) cinder_volume_type: their volumes (image-<id>, project service) go to
 # the multiattach type by a retype on the same back end (no data copy, image IDs unchanged).

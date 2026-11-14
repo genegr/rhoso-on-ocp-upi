@@ -55,3 +55,5 @@ cinder_volume_type: pure
 # available or downloading to reserve, but the current status is attaching"). Private: only the service project
 # (Glance's volumes) uses it.
 glance_volume_type: glance-multiattach
+# Cinder quotas of project service set to unlimited (-1): every Glance image is a volume there.
+glance_service_quota: [volumes, gigabytes, snapshots]

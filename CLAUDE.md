@@ -45,6 +45,15 @@ nodes. Ansible drives every step from that repo's pinned toolbox container on th
 - **A "changed" with no spec change** (generation unchanged, the diff only moves our `managedFields` entry) means the
   operator puts back at admission something the template leaves out: we rewrite it, it restores it, every run. Found
   with `dns.template.options` (`local /openstack.svc/`). Compare the rendered CR with the live one and add the field.
+- **Never change a password in `osp-secret` alone on a running control plane**: the services and the
+  openstackclient take the new value, but Keystone keeps the old one (no bootstrap rerun), so every login with it
+  gets 401 (found 2026-11-14 with AdminPassword). The admin password goes into Keystone through its API first
+  (`roles/rhoso_controlplane/tasks/admin_password.yml`, from `vault_rhoso_admin_password`). Service passwords: not
+  supported after deployment.
+- **No iSCSI logins on the computes outside OpenStack.** Records written by the host's newer iscsiadm (e.g. before
+  the EUS distro-sync) carry `node.session.conn_reopen_log_freq`, which nova_compute's iscsiadm rejects ("config file
+  ... invalid"): every attach to that target fails, and so does live migration with a volume (found 2026-11-14:
+  hand-made 500 GB volumes per compute from 2026-11-05, logged in on two hosts). `verify.yml` checks it.
 - Computes with different CPUs: Nova's default `host-model` breaks live migration between them ("guest CPU doesn't
   match specification: missing features"). `rhoso.dataplane.cpu_groups` = one node set per CPU group, each with its
   own Nova service and `cpu_models` (pick with `virsh hypervisor-cpu-compare` inside `nova_compute`).

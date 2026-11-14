@@ -9,6 +9,8 @@
         name: "{{ tr.name }}"
         namespace: "{{ rhoso_namespace }}"
       spec:
+        # tempest cleanup after the run: objects of interrupted or failed tests (projects, users, servers, networks).
+        cleanup: true
         networkAttachments: ["{{ tempest_nad }}"]
         storageClass: "{{ e.rhoso.controlplane.storage_class }}"
         tempestRun: >-
@@ -23,6 +25,10 @@
           deployerInput: "{{ tempest_deployer_input }}"
           overrides: "{{ tempest_overrides | join(' ') }}"
   register: tp_cr
+  # Only new (or just deleted by "Start over") runs: a spec change on a finished CR could make the operator run it again.
+  when: >-
+    tr.name not in tp_now.resources | map(attribute='metadata.name') | list
+    or tempest_rerun | default(false) | bool or tr.fresh | default(false)
 
 # The CR's conditions are no end marker: a run with failed tests ends with the pod in Failed and the CR reading
 # "NetworkAttachments error" (the finished pod has no interfaces left). The pod phase is.

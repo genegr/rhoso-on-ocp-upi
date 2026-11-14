@@ -7,3 +7,6 @@ vault_ad_user: EXAMPLE\administrator
 vault_ad_password: CHANGE_ME
 vault_edpm_root_password: CHANGE_ME     # one-time bootstrap of the data-plane SSH key
 vault_flasharray_api_token: CHANGE_ME
+# Optional. Unset = generated once into .state/<env>/ (osp-secret/AdminPassword, tenants/<user>.password).
+# vault_rhoso_admin_password: CHANGE_ME   # OpenStack admin (rhoso.yml --tags controlplane)
+# vault_tenant_password: CHANGE_ME        # every tenant user (tenant.yml)
