@@ -1,0 +1,19 @@
+---
+# Tempest through the test-operator (installed with the openstack-operator). Runs one after the other, each a Tempest CR:
+tempest_runs:
+  - name: tempest-smoke
+    smoke: true
+    include: ""
+    timeout_min: 120
+  - name: tempest-api-scenario
+    smoke: false
+    include: |
+      tempest.api
+      tempest.scenario
+    timeout_min: 480
+tempest_concurrency: 4
+# The pod needs to reach the floating IPs (validation and scenario tests SSH into instances): a macvlan leg on the OCP
+# nodes' NIC on the external port group (ovn_datacentre_portgroup, unused by OVN since the gateways are on the computes).
+tempest_nad: tempest-ext                # <= 15 characters: the pod interface is named after it (IFNAMSIZ) and the operator compares them
+tempest_external_range: [230, 235]      # host numbers in networks.external, outside the FIP pool, router, netcheck
+tempest_image_url: https://download.cirros-cloud.net/0.6.3/cirros-0.6.3-x86_64-disk.img

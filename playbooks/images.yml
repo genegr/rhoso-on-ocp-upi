@@ -1,0 +1,63 @@
+---
+# Public Glance images for the users (stored on the Pure back end through Glance on Cinder), from `images:` in
+# envs/<env>.yaml: {name, url, checksum: sha256:<hex>, min_disk (GB), min_ram (MB), properties: {...}}. Each image is
+# downloaded once into .state/<env>/images (checksum verified), copied into the openstackclient pod, created if missing
+# and the pod copy removed. A second run reports changed=0. Pin releases with their SHA256SUMS.
+#   ansible-playbook playbooks/images.yml -e env=<name>
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - env_model
+
+- name: Images
+  hosts: localhost
+  gather_facts: false
+  vars:
+    rhoso_namespace: openstack
+    pod_dir: /home/cloud-admin
+  environment:
+    K8S_AUTH_KUBECONFIG: "/ocp/.state/clusters/{{ e.ocp_cluster }}/install/auth/kubeconfig"
+  module_defaults:
+    kubernetes.core.k8s_exec: {namespace: openstack, pod: openstackclient}
+  tasks:
+    - name: Images are configured (name, url, checksum sha256:...)
+      ansible.builtin.assert:
+        that:
+          - e.images | default([]) | length > 0
+          - e.images | rejectattr('checksum', 'match', '^sha256:[0-9a-f]{64}$') | list | length == 0
+        quiet: true
+
+    - name: Images in Glance
+      kubernetes.core.k8s_exec:
+        command: openstack image list -f json
+      register: im_now
+      changed_when: false
+
+    - name: Missing images
+      ansible.builtin.set_fact:
+        im_missing: "{{ e.images | rejectattr('name', 'in', im_now.stdout | from_json | map(attribute='Name')) | list }}"
+
+    - name: Download directory
+      ansible.builtin.file:
+        path: "{{ state_dir }}/images"
+        state: directory
+        mode: "0700"
+
+    - name: Upload {{ item.name }}
+      ansible.builtin.include_role:
+        name: rhoso_images
+        tasks_from: upload
+      loop: "{{ im_missing }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Images now
+      kubernetes.core.k8s_exec:
+        command: openstack image list -f value -c Name -c Status
+      register: im_after
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        var: im_after.stdout_lines

@@ -1,0 +1,72 @@
+---
+# One Tempest run (loop_var tr).
+- name: "{{ tr.name }}: Tempest CR (created once)"
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: test.openstack.org/v1beta1
+      kind: Tempest
+      metadata:
+        name: "{{ tr.name }}"
+        namespace: "{{ rhoso_namespace }}"
+      spec:
+        networkAttachments: ["{{ tempest_nad }}"]
+        storageClass: "{{ e.rhoso.controlplane.storage_class }}"
+        tempestRun: >-
+          {{ {'concurrency': tempest_concurrency}
+             | combine({'smoke': true} if tr.smoke else {'includeList': tr.include}) }}
+        tempestconfRun:
+          create: true
+          networkID: "{{ tp_net.stdout | trim }}"
+          image: "{{ tempest_image_url }}"
+          overrides: |
+            validation.run_validation true
+            compute-feature-enabled.live_migration true
+            compute-feature-enabled.block_migration_for_live_migration true
+            identity.v3_endpoint_type public
+  register: tp_cr
+
+- name: "{{ tr.name }}: finished"
+  kubernetes.core.k8s_info:
+    api_version: test.openstack.org/v1beta1
+    kind: Tempest
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ tr.name }}"
+  register: tp_state
+  until: >-
+    (tp_state.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
+     | map(attribute='status') | first | default('')) == 'True'
+    or (tp_state.resources[0].status.conditions | default([]) | selectattr('status', 'equalto', 'False')
+        | selectattr('severity', 'defined') | selectattr('severity', 'equalto', 'Error') | list | length > 0)
+  retries: "{{ (tr.timeout_min * 60 / 30) | int }}"
+  delay: 30
+  failed_when: false
+
+- name: "{{ tr.name }}: its pods"
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ rhoso_namespace }}"
+    label_selectors: ["instanceName={{ tr.name }}"]
+  register: tp_pods
+
+- name: "{{ tr.name }}: pod log"
+  kubernetes.core.k8s_log:
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ (tp_pods.resources | sort(attribute='metadata.creationTimestamp') | last).metadata.name }}"
+  register: tp_log
+  when: tp_pods.resources | length > 0
+  failed_when: false
+
+- name: "{{ tr.name }}: keep the log"
+  ansible.builtin.copy:
+    content: "{{ tp_log.log | default('') }}"
+    dest: "{{ tp_dir }}/{{ tr.name }}.log"
+    mode: "0600"
+  when: tp_log is not skipped
+
+- name: "{{ tr.name }}: totals"
+  ansible.builtin.debug:
+    msg:
+      - "status: {{ tp_state.resources[0].status.conditions | default([]) | map(attribute='type') | zip(tp_state.resources[0].status.conditions | default([]) | map(attribute='status')) | map('join', '=') | join(', ') }}"
+      - "{{ (tp_log.log | default('')).splitlines() | select('search', '^ ?- (Passed|Skipped|Expected Fail|Unexpected Success|Failed): ') | list }}"
+      - "{{ (tp_log.log | default('')).splitlines() | select('search', 'Sum of execute time|Totals') | list }}"
+      - "log: .state/{{ env }}/tempest/{{ tr.name }}.log"

@@ -1,0 +1,23 @@
+---
+# Tempest against the cloud (last gate before users get access), through the test-operator: smoke, then API +
+# scenario (roles/rhoso_tempest/defaults). The test pod gets a leg on the external network (NAD tempest-ext) to
+# reach the floating IPs it creates. Long (smoke ~30-60 min, API+scenario ~2-4 h): run in the background with output to
+# .state/rhoso-tempest.log. Logs: .state/<env>/tempest/<run>.log. -e tempest_rerun=true starts the runs again.
+#   ansible-playbook playbooks/tempest.yml -e env=<name> [-e tempest_rerun=true]
+- name: Environment
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - env_model
+
+- name: Tempest
+  hosts: localhost
+  gather_facts: false
+  vars:
+    rhoso_namespace: openstack
+  environment:
+    K8S_AUTH_KUBECONFIG: "/ocp/.state/clusters/{{ e.ocp_cluster }}/install/auth/kubeconfig"
+  tasks:
+    - name: Runs
+      ansible.builtin.include_role:
+        name: rhoso_tempest

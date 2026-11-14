@@ -1,0 +1,38 @@
+---
+# One image (item): download (checksum), into the pod, image create, remove the pod copy.
+- name: "{{ item.name }}: download (pinned checksum)"
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "{{ state_dir }}/images/{{ item.url | basename }}"
+    checksum: "{{ item.checksum }}"
+    mode: "0644"
+    timeout: 120
+
+- name: "{{ item.name }}: upload"
+  block:
+    - name: "{{ item.name }}: into the openstackclient pod"
+      kubernetes.core.k8s_cp:
+        namespace: "{{ rhoso_namespace }}"
+        pod: openstackclient
+        local_path: "{{ state_dir }}/images/{{ item.url | basename }}"
+        remote_path: "{{ pod_dir }}/{{ item.url | basename }}"
+        state: to_pod
+
+    - name: "{{ item.name }}: image create (public)"
+      kubernetes.core.k8s_exec:
+        command: >-
+          openstack image create {{ item.name }} --file {{ pod_dir }}/{{ item.url | basename }}
+          --disk-format {{ item.disk_format | default('qcow2') }} --container-format bare --public
+          --min-disk {{ item.min_disk | default(0) }} --min-ram {{ item.min_ram | default(0) }}
+          {{ item.properties | default({}) | dict2items | map(attribute='key') | zip(item.properties | default({}) | dict2items | map(attribute='value'))
+             | map('join', '=') | map('regex_replace', '^', '--property ') | join(' ') }}
+          -f json
+      register: im_create
+      changed_when: true
+      failed_when: im_create.rc | default(0) != 0
+  always:
+    - name: "{{ item.name }}: remove the pod copy"
+      kubernetes.core.k8s_exec:
+        command: rm -f {{ pod_dir }}/{{ item.url | basename }}
+      changed_when: false
+      failed_when: false

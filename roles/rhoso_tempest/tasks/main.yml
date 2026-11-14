@@ -1,0 +1,73 @@
+---
+# Tempest (RHOSO 18.0 "Validating and troubleshooting the deployed cloud": test-operator, Tempest CR). Each run in
+# tempest_runs: a Tempest CR (python-tempestconf generates the config against the external network), waited for, its
+# pod log kept in .state/<env>/tempest/<run>.log with the totals. A finished run is left as it is; -e tempest_rerun=true
+# deletes and starts them again.
+- name: Nodes and their interfaces
+  ansible.builtin.include_role:
+    name: rhoso_networks
+    tasks_from: ifaces
+
+- name: Values
+  ansible.builtin.set_fact:
+    tp_ext: "{{ e.networks.external }}"
+    tp_nic: "{{ (rn_pg_ifaces.values() | first)[e.rhoso.controlplane.ovn_datacentre_portgroup] }}"
+    tp_dir: "{{ state_dir }}/tempest"
+    tp_base: "{{ e.networks.external.cidr.split('/')[0].rsplit('.', 1)[0] }}"
+
+- name: State directory
+  ansible.builtin.file:
+    path: "{{ tp_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: External network ID
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rhoso_namespace }}"
+    pod: openstackclient
+    command: openstack network show {{ tenant_external_network | default('public') }} -f value -c id
+  register: tp_net
+  changed_when: false
+  failed_when: tp_net.rc | default(0) != 0 or tp_net.stdout | trim | length == 0
+
+- name: NAD {{ tempest_nad }} (macvlan on {{ tp_nic }}, {{ tp_base }}.{{ tempest_external_range[0] }}-{{ tempest_external_range[1] }})
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: k8s.cni.cncf.io/v1
+      kind: NetworkAttachmentDefinition
+      metadata:
+        name: "{{ tempest_nad }}"
+        namespace: "{{ rhoso_namespace }}"
+      spec:
+        config: >-
+          {{ {'cniVersion': '0.3.1', 'name': tempest_nad, 'type': 'macvlan', 'master': tp_nic,
+              'ipam': {'type': 'whereabouts', 'range': tp_ext.cidr,
+                       'range_start': tp_base ~ '.' ~ tempest_external_range[0],
+                       'range_end': tp_base ~ '.' ~ tempest_external_range[1]}} | to_json }}
+
+- name: Tempest runs (current)
+  kubernetes.core.k8s_info:
+    api_version: test.openstack.org/v1beta1
+    kind: Tempest
+    namespace: "{{ rhoso_namespace }}"
+  register: tp_now
+
+- name: Start over (tempest_rerun)
+  kubernetes.core.k8s:
+    api_version: test.openstack.org/v1beta1
+    kind: Tempest
+    namespace: "{{ rhoso_namespace }}"
+    name: "{{ item.name }}"
+    state: absent
+    wait: true
+  loop: "{{ tempest_runs }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: tempest_rerun | default(false) | bool
+
+- name: Runs, one after the other
+  ansible.builtin.include_tasks: run.yml
+  loop: "{{ tempest_runs }}"
+  loop_control:
+    loop_var: tr
+    label: "{{ tr.name }}"
