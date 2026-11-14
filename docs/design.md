@@ -241,18 +241,18 @@ image tag (matching the RHOSO release, S1), the images and the toolbox.
 | 2026-11-14 | Glance image volumes multiattach, `service` quota unlimited | defaults | Concurrent boots of one image; more than 10 images |
 | 2026-11-14 | Image signature verification not enforced in Nova | enforced | No signing workflow in the lab; Tempest is told so |
 | 2026-11-14 | Standard admin and tenant passwords from the vault | generated passwords | Lab convenience; the admin password goes through the Keystone API |
-| 2026-11-14 | Control plane on the compact cluster's VMs | bare-metal OCP nodes | Proof of concept of FlashArray performance; control plane under load out of scope (V3) |
+| 2026-11-14 | Control plane on the compact cluster's VMs | bare-metal OCP nodes | Proof of concept of FlashArray performance; control plane under load out of scope (V3). If that changes: 3 compact nodes on bare metal |
 
 ## 11. Open items and limits
 
 - **V3: the control plane runs on vSphere VMs, where Red Hat documents bare metal.** This is a known and accepted
   limit of the proof of concept. Under heavy provisioning (many instances or volumes created at once) the API
   services may respond more slowly than on bare metal. That's out of scope: the proof of concept measures the
-  FlashArray data path, and Tempest doesn't test it. If such load tests become in scope, the control plane moves to
-  bare metal: new bare-metal OCP workers join the cluster, and the control plane is pinned to them
-  (`OpenStackControlPlane` `nodeSelector`; NNCPs, NADs and MetalLB on the new nodes' NICs). Galera, RabbitMQ and the
-  OVN databases run 3 replicas each with quorum. On 2 workers one node holds 2 of the 3, and losing that node loses
-  quorum. A third worker, or keeping a master in the selection, avoids that.
+  FlashArray data path, and Tempest doesn't test it. If such load tests become in scope, the cluster moves from 3
+  compact nodes on VMs to 3 compact nodes on bare metal: the same layout, so quorum (Galera, RabbitMQ, OVN DBs, 3
+  replicas each) and the RHOSO roles stay as they are. Each bare-metal node needs one NIC (or VLAN) per network the
+  masters have today (section 2). The OCP repo's platform layer creates only vSphere VMs, so booting the
+  self-installing ISOs on physical servers (through their BMC's virtual media) is new work there.
 - The `[recheck]` rows of network-requirements.md still need a browser check against the Red Hat docs.
 - **No live migration between CPU vendors.** Cold migration only.
 - **Not deployed:** Octavia (load balancers), Designate, Heat, Manila, Swift, telemetry. Adding one means enabling it
